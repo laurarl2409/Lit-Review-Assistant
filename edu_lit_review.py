@@ -288,60 +288,120 @@ GROUNDING RULES (non-negotiable):
 - Distinguish causal evidence (RCTs, quasi-experiments) from descriptive or
   correlational evidence, based only on what the abstracts state."""
 
-REPORT_INSTRUCTIONS = """Write a Markdown report with EXACTLY this structure.
-Output raw Markdown only — no code fences, no preamble.
+COMMON_RULES = """Write a Markdown report with EXACTLY the structure below.
+Output raw Markdown only — no code fences, no preamble, no extra sections.
+FORMATTING RULES (identical every time):
+- Table column headers must match the spec exactly, word for word.
+- Evidence-strength values must be EXACTLY one word: Strong, Moderate, or Weak.
+- Coverage-cell values must be EXACTLY one word: Covered, Partial, or Gap.
+- Do not use bold or italics inside table cells.
+- Do not add a References section — it is generated separately."""
+
+CONSENSUS_INSTRUCTIONS = COMMON_RULES + """
 
 Line 1 (machine-readable, nothing before it):
 CONSENSUS_METER: <Strong|Moderate/Mixed|Weak> | supporting=<int>% mixed=<int>% contradicting=<int>%
 (Percentages must sum to 100 and reflect your paper-by-paper reading.)
 
 Line 2:
-REPORT_TITLE: <one declarative sentence stating the answer to the question, max 16 words>
-
-Then these five sections:
+REPORT_TITLE: <one declarative sentence answering the question, max 16 words>
 
 ## 1. Introduction
-2-3 paragraphs: what the included literature says about the question, where
-the evidence is uneven, and an explicit statement of the consensus category
-with the approximate share of papers supporting / mixed / contradicting.
+2-3 paragraphs: what the included literature says about the question, where the
+evidence is uneven, and an explicit statement of the consensus category with the
+approximate share of papers supporting / mixed / contradicting.
 
 ## 2. Methods
 One paragraph describing the databases searched (ERIC, OpenAlex, Semantic
-Scholar), the query, and the screening logic, referencing the counts provided
-(retrieved, screened after deduplication, included with usable abstracts).
+Scholar), the query, and the screening logic, referencing the counts provided.
 Note evidence-hierarchy weighting (systematic reviews/RCTs > quasi-experimental
 > correlational > qualitative/descriptive).
 
 ## 3. Results
 ### Key Papers
 One short paragraph naming the 3-4 anchor papers and why they anchor the corpus.
-Then a Markdown table (4-6 rows): Paper | Year | Design | Core finding | Citations.
+Then a Markdown table (4-6 rows) with EXACTLY these columns:
+Paper | Year | Design | Core finding
 The Paper column uses bracketed numbers like [3].
 ### <Thematic subsection title> (2-4 of these, each 1-2 paragraphs citing papers)
 ### Timeline and Venues
-One paragraph on publication-year spread and notable venues, using only the
-supplied metadata.
+One paragraph on publication-year spread and notable venues, from metadata only.
 
 ## 4. Discussion
 2-3 paragraphs on what the corpus supports best and its causal vs. descriptive
-limits. Then a Markdown table (4-6 rows): Claim | Evidence Strength | Reasoning | Papers.
-The Evidence Strength cell must be EXACTLY one word: Strong, Moderate, or Weak.
+limits. Then a Markdown table (4-6 rows) with EXACTLY these columns:
+Claim | Evidence Strength | Reasoning | Papers
 
 ## 5. Conclusion
 1-2 closing paragraphs, including a caution that this reflects only the
 retrieved records, not the entire literature.
 ### Research Gaps
-One paragraph, then a Markdown coverage table: rows = the main themes you found;
-columns = Theme | Causal Tests | Long-Term Outcomes | Equity | Generalization.
-Every non-Theme cell must be EXACTLY one word: Covered, Partial, or Gap —
-judged strictly from the included papers.
+One paragraph, then a Markdown coverage table with EXACTLY these columns:
+Theme | Causal Tests | Long-Term Outcomes | Equity | Generalization
 ### Open Research Questions
-A Markdown table (3-5 rows): Question | Why It Matters."""
+A Markdown table (3-5 rows) with EXACTLY these columns: Question | Why It Matters"""
+
+LANDSCAPE_INSTRUCTIONS = COMMON_RULES + """
+
+This is an enumeration question (what/which/who), so map the answer space
+rather than measuring a single consensus.
+
+Line 1 (machine-readable, nothing before it):
+FINDINGS_SUMMARY: <Finding name> = <Strong|Moderate|Weak>; <Finding name> = <Strong|Moderate|Weak>; ...
+(3-7 findings covering the distinct answers in the corpus; names of at most
+6 words; strength reflects the evidence behind each finding.)
+
+Line 2:
+REPORT_TITLE: <one declarative sentence summarizing the main findings, max 16 words>
+
+## 1. Introduction
+2-3 paragraphs: an overview of the answer space the included literature covers,
+which findings rest on the strongest evidence, and where coverage is thin.
+
+## 2. Methods
+One paragraph describing the databases searched (ERIC, OpenAlex, Semantic
+Scholar), the query, and the screening logic, referencing the counts provided.
+Note evidence-hierarchy weighting (systematic reviews/RCTs > quasi-experimental
+> correlational > qualitative/descriptive).
+
+## 3. Findings
+For EACH finding, in the same order as FINDINGS_SUMMARY, write:
+### <Finding name> :: <Strong|Moderate|Weak>
+followed by 1-2 paragraphs describing the finding, citing papers, and noting
+the study designs behind it.
+
+## 4. Discussion
+2-3 paragraphs on the overall shape of the evidence and its causal vs.
+descriptive limits. Then a Markdown table (one row per finding) with EXACTLY
+these columns: Finding | Evidence Strength | Key Papers
+
+## 5. Conclusion
+1-2 closing paragraphs, including a caution that this reflects only the
+retrieved records, not the entire literature.
+### Research Gaps
+One paragraph, then a Markdown coverage table (rows = the findings) with
+EXACTLY these columns:
+Finding | Causal Tests | Long-Term Outcomes | Equity | Generalization
+### Open Research Questions
+A Markdown table (3-5 rows) with EXACTLY these columns: Question | Why It Matters"""
+
+
+def question_mode(q):
+    """Enumeration questions get a findings-landscape report; everything else
+    gets the consensus-meter report."""
+    first = re.match(r"\s*(\w+)", q.lower())
+    first = first.group(1) if first else ""
+    if first in ("what", "which", "who", "where", "why") or \
+            re.match(r"\s*how\s+(do|does|are|is|can|has|have)\b.*\b(vary|differ)", q.lower()):
+        return "landscape"
+    return "consensus"
 
 GEMINI_MODEL = "gemini-3.5-flash"  # has a free tier as of mid-2026
+# Your personal key, pre-filled in the sidebar. Remove before sharing this file.
+DEFAULT_GEMINI_KEY = "AQ.Ab8RN6JwhGy7sTadYI0FJB33ioksJ6es1O9hZUfGPd7iqVhENw"
 
 
-def synthesize(api_key, question, context, counts):
+def synthesize(api_key, question, context, counts, mode="consensus"):
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=api_key)
@@ -352,10 +412,11 @@ def synthesize(api_key, question, context, counts):
         f"Semantic Scholar {counts['s2']}); Screened after dedup: "
         f"{counts['screened']}; Included with usable abstracts: {counts['included']}.\n\n"
         f"INCLUDED PAPERS (your ONLY evidence base):\n\n{context}\n\n"
-        f"{REPORT_INSTRUCTIONS}"
+        + (LANDSCAPE_INSTRUCTIONS if mode == "landscape" else CONSENSUS_INSTRUCTIONS)
     )
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT, max_output_tokens=16000)
+        system_instruction=SYSTEM_PROMPT, max_output_tokens=16000,
+        temperature=0.2)   # low temperature keeps formatting identical across runs
     last_err = None
     for attempt in range(3):
         try:
@@ -402,6 +463,22 @@ def parse_meter(report):
     return meter, report[m.end():].lstrip()
 
 
+def parse_findings(report):
+    """Extract the FINDINGS_SUMMARY line for landscape reports."""
+    m = re.search(r"FINDINGS_SUMMARY:\s*(.+)", report)
+    if not m:
+        return None, report
+    items = []
+    for part in m.group(1).split(";"):
+        if "=" in part:
+            name, _, s = part.rpartition("=")
+            s = s.strip().rstrip(".")
+            if s in ("Strong", "Moderate", "Weak") and name.strip():
+                items.append((name.strip().strip("*"), s))
+    body = (report[:m.start()] + report[m.end():]).lstrip()
+    return (items or None), body
+
+
 def parse_title(body, fallback):
     m = re.search(r"^REPORT_TITLE:\s*(.+?)\s*$", body, flags=re.MULTILINE)
     if not m:
@@ -414,14 +491,32 @@ def parse_title(body, fallback):
 # Report rendering — one pipeline used both in-app and in the HTML export
 # ==========================================================================
 
-def _strength_meter_cell(word):
-    fills = {"Strong": (8, GREEN), "Moderate": (6, AMBER), "Weak": (2, RED)}
-    n, color = fills[word]
+STRENGTH_FILLS = {"Strong": (8, GREEN), "Moderate": (6, AMBER), "Weak": (2, RED)}
+
+
+def _meter_html(word):
+    n, color = STRENGTH_FILLS[word]
     segs = "".join(
         f'<i style="background:{color}"></i>' if k < n else "<i></i>"
         for k in range(10))
-    return (f'<td class="strength"><span class="meter10">{segs}</span>'
-            f'<span class="meter-word" style="color:{color}">{word}</span></td>')
+    return (f'<span class="meter10">{segs}</span>'
+            f'<span class="meter-word" style="color:{color}">{word}</span>')
+
+
+def _strength_meter_cell(word):
+    return f'<td class="strength">{_meter_html(word)}</td>'
+
+
+def findings_hero_html(findings):
+    if not findings:
+        return ""
+    rows = "".join(
+        f'<div class="fh-row"><span class="fh-name">{html_lib.escape(n)}</span>'
+        f'<span class="finding-chip">{_meter_html(s)}</span></div>'
+        for n, s in findings)
+    return ('<div class="verdict">'
+            '<div class="verdict-eyebrow">Evidence at a glance</div>'
+            f'<div class="fh-list">{rows}</div></div>')
 
 
 def render_report_html(body_md):
@@ -439,6 +534,11 @@ def render_report_html(body_md):
     h = h.replace('<td>Moderate/Mixed</td>', _strength_meter_cell("Moderate"))
     for word, cls in (("Covered", "cov"), ("Partial", "par"), ("Gap", "gap")):
         h = h.replace(f"<td>{word}</td>", f'<td class="hm hm-{cls}">{word}</td>')
+    h = re.sub(
+        r"<h3>(.*?)\s*::\s*(Strong|Moderate|Weak)</h3>",
+        lambda m: (f'<h3 class="finding-h"><span>{m.group(1)}</span>'
+                   f'<span class="finding-chip">{_meter_html(m.group(2))}</span></h3>'),
+        h)
     return h
 
 
@@ -542,6 +642,16 @@ REPORT_CSS = f"""
 .report-doc .hm-cov {{ background:#E9F1EB; color:{GREEN}; }}
 .report-doc .hm-par {{ background:#F6EDDD; color:{AMBER}; }}
 .report-doc .hm-gap {{ background:#F5E7E7; color:{RED}; }}
+.report-doc .finding-h {{ display:flex; align-items:center;
+  justify-content:space-between; gap:16px; flex-wrap:wrap; }}
+.finding-chip {{ display:inline-flex; align-items:center; gap:8px;
+  white-space:nowrap; }}
+.finding-chip .meter-word {{ display:inline; margin-top:0; }}
+.fh-list {{ display:flex; flex-direction:column; margin-top:8px; }}
+.fh-row {{ display:flex; align-items:center; justify-content:space-between;
+  gap:16px; padding:9px 0; border-bottom:1px solid {RULE}; }}
+.fh-row:last-child {{ border-bottom:none; }}
+.fh-name {{ font-weight:600; font-size:.92rem; color:{INK}; }}
 
 .verdict {{ background:{CARD}; border:1px solid {LINE}; border-radius:14px;
   padding:22px 26px; margin:4px 0 14px;
@@ -585,7 +695,7 @@ REPORT_CSS = f"""
 """
 
 
-def build_html_export(title, question, meter, report_html, counts):
+def build_html_export(title, question, hero_html, report_html, counts):
     t, q = html_lib.escape(title), html_lib.escape(question)
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -632,7 +742,7 @@ def build_html_export(title, question, meter, report_html, counts):
 <h1 class="headline">{t}</h1>
 <div class="subtitle">{q} &middot; Generated {date.today().strftime("%B %d, %Y")}
  &middot; {counts["included"]} papers synthesized from {counts["retrieved"]} retrieved records</div>
-{verdict_html(meter)}
+{hero_html}
 {prisma_html(counts)}
 <div class="report-doc">
 {report_html}
@@ -776,7 +886,7 @@ with st.sidebar:
     st.markdown("#### Setup")
     api_key = st.text_input(
         "Gemini API key", type="password",
-        value=os.environ.get("GEMINI_API_KEY", ""),
+        value=os.environ.get("GEMINI_API_KEY", DEFAULT_GEMINI_KEY),
         help="Paste a key from Google AI Studio. The free tier of "
              f"{GEMINI_MODEL} is enough — no billing needed.")
     st.markdown(
@@ -852,10 +962,12 @@ if run:
                      "specific program names.")
             st.stop()
 
-        st.write(f"{counts['included']} papers included. Synthesizing with Gemini…")
+        mode = question_mode(q)
+        st.write(f"{counts['included']} papers included. Synthesizing with Gemini "
+                 f"({'findings landscape' if mode == 'landscape' else 'consensus'} report)…")
         try:
             raw = clean_llm_output(
-                synthesize(api_key, q, build_context(included), counts))
+                synthesize(api_key, q, build_context(included), counts, mode))
         except Exception as e:
             status.update(label="Synthesis failed", state="error")
             st.error(f"Synthesis failed: {e}")
@@ -863,11 +975,14 @@ if run:
         status.update(label="Report ready", state="complete", expanded=False)
 
     meter, body = parse_meter(raw)
+    findings, body = parse_findings(body)
     title, body = parse_title(body, q)
     body = body + "\n\n" + make_references_md(included)
+    for k in [k for k in st.session_state if str(k).startswith("sel_")]:
+        del st.session_state[k]        # reset paper selections for the new result
     st.session_state.result = {
-        "question": q, "title": title, "meter": meter, "body": body,
-        "counts": counts, "included": included,
+        "question": q, "title": title, "meter": meter, "findings": findings,
+        "mode": mode, "body": body, "counts": counts, "included": included,
     }
 
 if "result" not in st.session_state:
@@ -904,16 +1019,38 @@ if "result" in st.session_state:
         f'{counts["retrieved"]} retrieved records</div></div>',
         unsafe_allow_html=True)
 
-    if meter:
+    if r.get("mode") == "landscape" and r.get("findings"):
+        st.markdown(findings_hero_html(r["findings"]), unsafe_allow_html=True)
+    elif meter:
         st.markdown(verdict_html(meter), unsafe_allow_html=True)
     st.markdown(prisma_html(counts), unsafe_allow_html=True)
+
+    hero = (findings_hero_html(r["findings"])
+            if r.get("mode") == "landscape" and r.get("findings")
+            else verdict_html(meter))
+    html_out = build_html_export(r["title"], r["question"], hero,
+                                 report_html, counts)
+    dl1, dl2, _sp = st.columns([1, 1, 1])
+    with dl1:
+        st.download_button(
+            "Download report (HTML)", html_out,
+            file_name="deep_search_report.html", mime="text/html",
+            use_container_width=True, type="primary")
+    with dl2:
+        st.download_button(
+            "Download bibliography (.bib)", make_bibtex(r["included"]),
+            file_name="literature_review.bib", mime="text/plain",
+            use_container_width=True)
+    st.caption("Open the HTML report in a browser and press Ctrl+P / Cmd+P for "
+               "a clean PDF. To pick which papers go to Zotero, use the "
+               "Zotero export tab.")
 
     if "## 5" not in r["body"]:
         st.warning("This report looks shorter than expected — it may have been "
                    "truncated. Running the search again usually fixes it.")
 
     tab_report, tab_papers, tab_export = st.tabs(
-        ["Report", f"Included papers ({counts['included']})", "Export"])
+        ["Report", f"Included papers ({counts['included']})", "Zotero export"])
 
     with tab_report:
         st.markdown(f'<div class="report-doc">{report_html}</div>',
@@ -926,21 +1063,37 @@ if "result" in st.session_state:
         st.markdown(papers_html(r["included"]), unsafe_allow_html=True)
 
     with tab_export:
-        bib = make_bibtex(r["included"])
-        html_out = build_html_export(r["title"], r["question"], meter,
-                                     report_html, counts)
-        d1, d2 = st.columns(2)
-        with d1:
-            st.download_button(
-                "Download BibTeX for Zotero", bib,
-                file_name="literature_review.bib", mime="text/plain",
-                use_container_width=True)
-            st.caption("Import into Zotero via File → Import to add all "
-                       f"{counts['included']} included papers.")
-        with d2:
-            st.download_button(
-                "Download HTML report", html_out,
-                file_name="deep_search_report.html", mime="text/html",
-                use_container_width=True)
-            st.caption("Open in a browser and press Ctrl+P / Cmd+P — the "
-                       "print stylesheet formats it as a clean PDF.")
+        st.markdown("Choose which papers to include, then download the .bib "
+                    "file and import it into Zotero via **File → Import**.")
+
+        def _set_all(value):
+            for k in range(len(r["included"])):
+                st.session_state[f"sel_{k}"] = value
+
+        b1, b2, _bsp = st.columns([1, 1, 4])
+        with b1:
+            st.button("Select all", on_click=_set_all, args=(True,),
+                      use_container_width=True)
+        with b2:
+            st.button("Clear all", on_click=_set_all, args=(False,),
+                      use_container_width=True)
+
+        left, right = st.columns(2)
+        for idx, p in enumerate(r["included"]):
+            label = f"[{idx + 1}] {p['title'][:70]}" + \
+                    ("…" if len(p["title"]) > 70 else "")
+            with (left if idx % 2 == 0 else right):
+                if f"sel_{idx}" not in st.session_state:
+                    st.session_state[f"sel_{idx}"] = True
+                st.checkbox(label, key=f"sel_{idx}", help=p["title"])
+
+        selected = [p for idx, p in enumerate(r["included"])
+                    if st.session_state.get(f"sel_{idx}", True)]
+        st.download_button(
+            f"Download {len(selected)} selected paper"
+            f"{'s' if len(selected) != 1 else ''} (.bib)",
+            make_bibtex(selected) if selected else "",
+            file_name="literature_review.bib", mime="text/plain",
+            disabled=not selected, type="primary")
+        if not selected:
+            st.caption("Select at least one paper to enable the download.")
