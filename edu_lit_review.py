@@ -605,7 +605,7 @@ def _mini_md(md):
         h += [f"<th>{_inline_md(c)}</th>" for c in rows[0]]
         h.append("</tr></thead><tbody>")
         body = rows[1:]
-        if body and all(re.fullmatch(r":?-{2,}:?", c) for c in body[0]):
+        if body and all(re.fullmatch(r":?-+:?", c) for c in body[0]):
             body = body[1:]
         for r in body:
             h.append("<tr>" + "".join(f"<td>{_inline_md(c)}</td>" for c in r)
@@ -752,6 +752,123 @@ def papers_html(included):
     return '<div class="paper-list">' + "".join(items) + "</div>"
 
 
+def stat_strip_html(included, counts):
+    years = [p["year"] for p in included if p["year"]]
+    span = (f"{min(years)}&ndash;{max(years)}" if len(set(years)) > 1
+            else (str(years[0]) if years else "&mdash;"))
+    cites = [p["citations"] for p in included if p["citations"] is not None]
+    cite_s = f"{sum(cites):,}" if cites else "&mdash;"
+    sources = len({p["source"] for p in included})
+    stats = [(str(counts["included"]), "Papers analyzed"),
+             (span, "Publication span"),
+             (cite_s, "Citations tracked"),
+             (str(sources), "Databases contributing")]
+    cells = "".join(
+        f'<div class="stat"><div class="stat-n">{n}</div>'
+        f'<div class="stat-l">{l}</div></div>' for n, l in stats)
+    return f'<div class="stats">{cells}</div>'
+
+
+def timeline_html(included):
+    years = sorted(p["year"] for p in included if isinstance(p["year"], int))
+    if len(set(years)) < 2:
+        return ""
+    lo, hi = min(years), max(years)
+    span = hi - lo
+    size = 1 if span <= 14 else 2 if span <= 28 else 5
+    lo -= lo % size
+    buckets = list(range(lo, hi + 1, size))
+    counts_by = {b: 0 for b in buckets}
+    for y in years:
+        counts_by[lo + ((y - lo) // size) * size] += 1
+    mx = max(counts_by.values())
+    label_every = 1 if len(buckets) <= 12 else 2
+    bars, labels = [], []
+    for i, b in enumerate(buckets):
+        c = counts_by[b]
+        hpx = max(int(96 * c / mx), 4) if c else 0
+        cnt = f'<div class="tl-c">{c}</div>' if c else ""
+        bar = (f'<div class="tl-bar" style="height:{hpx}px"></div>' if c
+               else '<div class="tl-bar tl-zero"></div>')
+        bars.append(f'<div class="tl-col">{cnt}{bar}</div>')
+        lab = str(b) if size == 1 else f"{b}&ndash;{str(b + size - 1)[-2:]}"
+        labels.append('<div class="tl-col"><div class="tl-x">'
+                      + (lab if i % label_every == 0 else "&nbsp;")
+                      + "</div></div>")
+    return ('<div class="tl-wrap"><div class="tl">' + "".join(bars)
+            + '</div><div class="tl-axis">' + "".join(labels) + "</div></div>")
+
+
+def _figcap(n, text):
+    return f'<div class="figcap"><b>Figure {n}</b>&ensp;{text}</div>'
+
+
+def decorate_report_html(h, counts, included):
+    """Deterministic per-section visuals: numbered section markers, an intro
+    stat strip, PRISMA inside Methods, a publication timeline in Results,
+    figure captions on the claim matrix and coverage heatmap, question cards,
+    and a numbered reference grid. Pure post-processing — identical output
+    for identical inputs, never dependent on the LLM."""
+    # numbered section headings -> markers; unnumbered h2s get the rule too
+    h = re.sub(r"<h2>(\d)\.\s*(.*?)</h2>",
+               lambda m: (f'<h2 class="sec"><span class="sec-n">0{m.group(1)}'
+                          f'</span><span>{m.group(2)}</span></h2>'), h)
+    h = re.sub(r"<h2>(?!<)(.*?)</h2>",
+               r'<h2 class="sec sec-plain"><span>\1</span></h2>', h)
+
+    fig = 1
+    # Introduction: stat strip
+    m = re.search(r'<h2 class="sec"><span class="sec-n">01</span><span>[^<]*</span></h2>', h)
+    if m:
+        h = h[:m.end()] + stat_strip_html(included, counts) + h[m.end():]
+    # Methods: PRISMA flow + caption
+    m = re.search(r'<h2 class="sec"><span class="sec-n">02</span><span>[^<]*</span></h2>', h)
+    if m:
+        block = prisma_html(counts) + _figcap(fig, "Search screening and inclusion flow")
+        h = h[:m.end()] + block + h[m.end():]
+        fig += 1
+    # Results: timeline chart (after the Timeline heading, else before Discussion)
+    tl = timeline_html(included)
+    if tl:
+        block = tl + _figcap(fig, "Included papers by publication year")
+        m = re.search(r"<h3>Timeline and Venues</h3>", h)
+        if m:
+            h = h[:m.end()] + block + h[m.end():]
+            fig += 1
+        else:
+            m = (re.search(r'<h2 class="sec"><span class="sec-n">04</span>', h)
+                 or re.search(r'<h2 class="sec sec-plain"><span>References</span></h2>', h))
+            if m:
+                h = h[:m.start()] + block + h[m.start():]
+                fig += 1
+    # Discussion: caption under the claim/finding matrix
+    m = re.search(r'(<h2 class="sec"><span class="sec-n">04</span>.*?</table>)', h, re.S)
+    if m:
+        h = h[:m.end()] + _figcap(fig, "Claims and the strength of evidence behind them") + h[m.end():]
+        fig += 1
+    # Conclusion: caption under the coverage heatmap
+    m = re.search(r"(<h3>Research Gaps</h3>.*?</table>)", h, re.S)
+    if m:
+        h = h[:m.end()] + _figcap(fig, "Evidence coverage by theme") + h[m.end():]
+        fig += 1
+    # Open Research Questions table -> numbered cards
+    def _oq_cards(mt):
+        rows = re.findall(r"<tr>\s*<td>(.*?)</td>\s*<td>(.*?)</td>\s*</tr>", mt.group(0), re.S)
+        cards = "".join(
+            f'<div class="oq"><div class="oq-n">{i:02d}</div><div>'
+            f'<div class="oq-q">{q}</div><div class="oq-why">{w}</div></div></div>'
+            for i, (q, w) in enumerate(rows, 1))
+        return cards or mt.group(0)
+    h = re.sub(r"<table>\s*<thead>\s*<tr>\s*<th>Question</th>\s*"
+               r"<th>Why It Matters</th>\s*</tr>\s*</thead>.*?</table>",
+               _oq_cards, h, flags=re.S)
+    # References paragraphs -> numbered grid rows
+    h = re.sub(r"<p><strong>\[(\d+)\]</strong>\s*(.*?)</p>",
+               r'<div class="ref"><span class="ref-n">[\1]</span>'
+               r'<span class="ref-b">\2</span></div>', h, flags=re.S)
+    return h
+
+
 # --- Report CSS, scoped to .report-doc, shared by app and export ----------
 
 REPORT_CSS = f"""
@@ -834,6 +951,56 @@ REPORT_CSS = f"""
 .src {{ font-family:'IBM Plex Mono',monospace; font-size:.66rem;
   font-weight:600; padding:1px 8px; border-radius:999px; margin-left:8px;
   border:1px solid {LINE}; color:{MUTED}; background:#F6F4EF; }}
+
+/* Section markers */
+.report-doc h2.sec {{ display:flex; align-items:baseline; gap:14px;
+  border-top:1px solid {LINE}; padding-top:20px; margin-top:2.9em; }}
+.report-doc h2.sec:first-child {{ border-top:none; padding-top:0; margin-top:.6em; }}
+.report-doc .sec-n {{ font-family:'IBM Plex Mono',monospace; font-weight:600;
+  font-size:.78rem; letter-spacing:.08em; color:{MUTED}; }}
+
+/* Intro stat strip */
+.stats {{ display:flex; flex-wrap:wrap; border:1px solid {LINE};
+  border-radius:12px; background:#FCFBF8; margin:16px 0 6px; overflow:hidden; }}
+.stat {{ flex:1; min-width:130px; padding:14px 18px;
+  border-left:1px solid {RULE}; }}
+.stat:first-child {{ border-left:none; }}
+.stat-n {{ font-family:'IBM Plex Mono',monospace; font-weight:600;
+  font-size:1.25rem; color:{INK}; }}
+.stat-l {{ font-size:.72rem; color:{MUTED}; margin-top:2px; }}
+
+/* Figure captions */
+.figcap {{ font-family:'IBM Plex Mono',monospace; font-size:.68rem;
+  letter-spacing:.05em; color:{MUTED}; margin:8px 0 26px; }}
+.figcap b {{ color:{INK}; font-weight:600; }}
+
+/* Publication timeline */
+.tl-wrap {{ margin:16px 0 4px; }}
+.tl {{ display:flex; align-items:flex-end; gap:5px; height:112px;
+  border-bottom:1px solid {LINE}; padding:0 2px; }}
+.tl-col {{ flex:1; display:flex; flex-direction:column; align-items:center;
+  justify-content:flex-end; gap:4px; min-width:0; }}
+.tl-bar {{ width:68%; max-width:30px; background:{GREEN};
+  border-radius:3px 3px 0 0; }}
+.tl-zero {{ height:0; }}
+.tl-c {{ font-family:'IBM Plex Mono',monospace; font-size:.64rem; color:{MUTED}; }}
+.tl-axis {{ display:flex; gap:5px; padding:0 2px; }}
+.tl-x {{ font-family:'IBM Plex Mono',monospace; font-size:.62rem;
+  color:{MUTED}; margin-top:5px; text-align:center; }}
+
+/* Open-question cards */
+.oq {{ display:flex; gap:16px; border:1px solid {LINE}; border-radius:12px;
+  background:#FCFBF8; padding:15px 18px; margin:10px 0; }}
+.oq-n {{ font-family:'IBM Plex Mono',monospace; font-weight:600;
+  font-size:.78rem; color:{MUTED}; padding-top:2px; }}
+.oq-q {{ font-weight:600; color:{INK}; }}
+.oq-why {{ font-size:.85rem; color:{MUTED}; margin-top:3px; line-height:1.55; }}
+
+/* Reference grid */
+.ref {{ display:flex; gap:14px; padding:9px 0; border-bottom:1px solid {RULE};
+  font-size:.85rem; line-height:1.55; }}
+.ref-n {{ font-family:'IBM Plex Mono',monospace; font-weight:600;
+  color:{MUTED}; min-width:36px; }}
 """
 
 
@@ -885,7 +1052,6 @@ def build_html_export(title, question, hero_html, report_html, counts):
 <div class="subtitle">{q} &middot; Generated {date.today().strftime("%B %d, %Y")}
  &middot; {counts["included"]} papers synthesized from {counts["retrieved"]} retrieved records</div>
 {hero_html}
-{prisma_html(counts)}
 <div class="report-doc">
 {report_html}
 </div>
@@ -1154,7 +1320,8 @@ if "result" in st.session_state:
     r = st.session_state.result
     meter, counts = r["meter"], r["counts"]
     full_body = r["body"] + "\n\n" + make_references_md(r["included"])
-    report_html = render_report_html(full_body)
+    report_html = decorate_report_html(
+        render_report_html(full_body), counts, r["included"])
 
     st.divider()
     st.markdown(
@@ -1170,7 +1337,6 @@ if "result" in st.session_state:
         st.markdown(findings_hero_html(r["findings"]), unsafe_allow_html=True)
     elif meter:
         st.markdown(verdict_html(meter), unsafe_allow_html=True)
-    st.markdown(prisma_html(counts), unsafe_allow_html=True)
 
     hero = (findings_hero_html(r["findings"])
             if r.get("mode") == "landscape" and r.get("findings")
