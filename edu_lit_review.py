@@ -39,6 +39,29 @@ GREEN = "#2F6B4F"
 AMBER = "#B97D2A"
 RED = "#A44444"
 
+# Force the light theme at Streamlit's config level so OS/browser dark mode
+# can never produce unreadable widgets, and persist it for future launches.
+try:
+    from streamlit import config as _st_config
+    _st_config.set_option("theme.base", "light")
+    _st_config.set_option("theme.primaryColor", INK)
+    _st_config.set_option("theme.backgroundColor", PAPER)
+    _st_config.set_option("theme.secondaryBackgroundColor", "#F3F1EB")
+    _st_config.set_option("theme.textColor", INK)
+except Exception:
+    pass
+try:
+    import pathlib
+    _cfg = pathlib.Path(".streamlit/config.toml")
+    if not _cfg.exists():
+        _cfg.parent.mkdir(exist_ok=True)
+        _cfg.write_text(
+            '[theme]\nbase="light"\nprimaryColor="%s"\n'
+            'backgroundColor="%s"\nsecondaryBackgroundColor="#F3F1EB"\n'
+            'textColor="%s"\n' % (INK, PAPER, INK))
+except Exception:
+    pass
+
 VERDICT_STYLE = {
     "Strong": (GREEN, "Strong consensus"),
     "Moderate/Mixed": (AMBER, "Moderate / mixed consensus"),
@@ -197,8 +220,8 @@ def fetch_semantic_scholar(query, s2_key=""):
 # Screening (PRISMA), grounding context, BibTeX, references
 # ==========================================================================
 
-def dedupe_and_screen(all_papers, max_included=25):
-    seen, screened = set(), []
+def dedupe_and_screen(all_papers, max_included=25, prior_keys=None):
+    seen, screened = set(prior_keys or ()), []
     for p in all_papers:
         keys = {re.sub(r"\W+", "", p["title"].lower())}
         if p["doi"]:
@@ -212,9 +235,9 @@ def dedupe_and_screen(all_papers, max_included=25):
     return screened, with_text[:max_included]
 
 
-def build_context(included):
+def build_context(included, start=1):
     blocks = []
-    for i, p in enumerate(included, 1):
+    for i, p in enumerate(included, start):
         authors = ", ".join(p["authors"][:5]) or "Unknown authors"
         blocks.append(
             f"[{i}] {p['title']}\n"
@@ -397,8 +420,6 @@ def question_mode(q):
     return "consensus"
 
 GEMINI_MODEL = "gemini-3.5-flash"  # has a free tier as of mid-2026
-# Your personal key, pre-filled in the sidebar. Remove before sharing this file.
-DEFAULT_GEMINI_KEY = "AQ.Ab8RN6JwhGy7sTadYI0FJB33ioksJ6es1O9hZUfGPd7iqVhENw"
 
 
 def synthesize(api_key, question, context, counts, mode="consensus"):
@@ -487,9 +508,130 @@ def parse_title(body, fallback):
     return title or fallback, (body[:m.start()] + body[m.end():]).lstrip()
 
 
+def extract_open_questions(body, limit=3):
+    """Pull the AI-generated Open Research Questions out of the report so they
+    can be offered as one-tap follow-ups."""
+    m = re.search(r"### Open Research Questions(.*?)(?=\n## |\Z)", body, re.S)
+    if not m:
+        return []
+    qs = []
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if line.startswith("|") and not set(line) <= set("|-: "):
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if cells and cells[0] and cells[0].lower() not in ("question",):
+                qs.append(cells[0])
+    return qs[:limit]
+
+
+def synthesize_followup(api_key, question, report_title, context, start_n):
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=api_key)
+    user_msg = (
+        f'You previously produced a grounded literature report titled:\n'
+        f'"{report_title}"\n\n'
+        f"FOLLOW-UP QUESTION: {question}\n\n"
+        f"NEW PAPERS (your ONLY citable sources for new claims; their numbering "
+        f"continues the original report's reference list):\n\n{context}\n\n"
+        f"Write a raw-Markdown addendum — no code fences, no preamble — with "
+        f"EXACTLY this shape:\n"
+        f"Line 1: ## Follow-up: {question}\n"
+        f"Then 2-4 paragraphs answering the follow-up using ONLY the new "
+        f"papers, with bracketed citations like [{start_n}]. If the answer "
+        f"enumerates several findings, add one Markdown table with EXACTLY "
+        f"these columns: Finding | Evidence Strength | Key Papers "
+        f"(strength EXACTLY one word: Strong, Moderate, or Weak).\n"
+        f"Close with one sentence connecting this to the original report's "
+        f"conclusion. Do not add a References section."
+    )
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT, max_output_tokens=8000,
+        temperature=0.2)
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL, contents=user_msg, config=config)
+            text = resp.text or ""
+            if not text.strip():
+                raise RuntimeError("Gemini returned an empty response — wait "
+                                   "a minute and try the follow-up again.")
+            return text
+        except Exception as e:
+            last_err = e
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                time.sleep(15 * (attempt + 1))
+            else:
+                raise
+    raise last_err
+
+
 # ==========================================================================
 # Report rendering — one pipeline used both in-app and in the HTML export
 # ==========================================================================
+
+def _inline_md(s):
+    s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", s)
+    return s
+
+
+def _mini_md(md):
+    """Small, dependency-free Markdown converter covering exactly the shapes
+    this app's reports use (headings, paragraphs, pipe tables, lists, bold,
+    italics, links). Used when the optional `markdown` package is missing, so
+    the report and export always render fully styled."""
+    out, para, table, ul = [], [], [], []
+
+    def flush_para():
+        if para:
+            out.append("<p>" + _inline_md(" ".join(para)) + "</p>")
+            para.clear()
+
+    def flush_ul():
+        if ul:
+            out.append("<ul>" + "".join(f"<li>{_inline_md(x)}</li>" for x in ul)
+                       + "</ul>")
+            ul.clear()
+
+    def flush_table():
+        if not table:
+            return
+        rows = [[c.strip() for c in r.strip().strip("|").split("|")]
+                for r in table]
+        h = ["<table>", "<thead><tr>"]
+        h += [f"<th>{_inline_md(c)}</th>" for c in rows[0]]
+        h.append("</tr></thead><tbody>")
+        body = rows[1:]
+        if body and all(re.fullmatch(r":?-{2,}:?", c) for c in body[0]):
+            body = body[1:]
+        for r in body:
+            h.append("<tr>" + "".join(f"<td>{_inline_md(c)}</td>" for c in r)
+                     + "</tr>")
+        h.append("</tbody></table>")
+        out.append("".join(h))
+        table.clear()
+
+    for raw in html_lib.escape(md).splitlines():
+        line = raw.rstrip()
+        if line.lstrip().startswith("|"):
+            flush_para(); flush_ul(); table.append(line); continue
+        flush_table()
+        s = line.strip()
+        if not s:
+            flush_para(); flush_ul(); continue
+        if s.startswith("### "):
+            flush_para(); flush_ul(); out.append(f"<h3>{_inline_md(s[4:])}</h3>"); continue
+        if s.startswith("## "):
+            flush_para(); flush_ul(); out.append(f"<h2>{_inline_md(s[3:])}</h2>"); continue
+        if s.startswith(("- ", "* ")):
+            flush_para(); ul.append(s[2:]); continue
+        flush_ul(); para.append(s)
+    flush_para(); flush_ul(); flush_table()
+    return "\n".join(out)
+
 
 STRENGTH_FILLS = {"Strong": (8, GREEN), "Moderate": (6, AMBER), "Weak": (2, RED)}
 
@@ -525,10 +667,10 @@ def render_report_html(body_md):
     # tolerate emoji heatmap cells from older prompts
     body_md = (body_md.replace("🟢", "Covered").replace("🟡", "Partial")
                .replace("🔴", "Gap"))
-    if not md_lib:
-        return ("<pre style='white-space:pre-wrap'>"
-                + html_lib.escape(body_md) + "</pre>")
-    h = md_lib.markdown(body_md, extensions=["tables", "sane_lists"])
+    if md_lib:
+        h = md_lib.markdown(body_md, extensions=["tables", "sane_lists"])
+    else:
+        h = _mini_md(body_md)
     for word in ("Strong", "Moderate", "Weak"):
         h = h.replace(f"<td>{word}</td>", _strength_meter_cell(word))
     h = h.replace('<td>Moderate/Mixed</td>', _strength_meter_cell("Moderate"))
@@ -763,7 +905,7 @@ APP_CSS = f"""
 
 .stApp, [data-testid="stAppViewContainer"] {{ background:{PAPER}; }}
 [data-testid="stHeader"] {{ background:{PAPER}; }}
-.block-container {{ max-width:960px; padding-top:2.4rem; }}
+.block-container {{ max-width:960px; padding-top:3.6rem; }}
 
 html, body, .stApp, .stMarkdown, .stMarkdown p, .stMarkdown li,
 [data-testid="stWidgetLabel"] p, [data-testid="stCaptionContainer"],
@@ -806,27 +948,32 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2 {{
   background:{CARD} !important; border-color:{LINE} !important;
 }}
 
-/* Buttons — explicit colors + press feedback */
-.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
+/* Buttons — every selector variant Streamlit uses, forced light */
+.stButton button, .stDownloadButton button, .stFormSubmitButton button,
+button[data-testid^="stBaseButton"] {{
   background:{CARD} !important; color:{INK} !important;
   border:1px solid {LINE} !important; border-radius:10px; font-weight:600;
   transition:transform 120ms cubic-bezier(0.23,1,0.32,1),
              background 150ms ease, border-color 150ms ease;
 }}
-.stButton > button:hover, .stDownloadButton > button:hover {{
+.stButton button p, .stDownloadButton button p,
+button[data-testid^="stBaseButton"] p {{ color:{INK} !important; }}
+.stButton button:hover, .stDownloadButton button:hover {{
   border-color:{INK} !important;
 }}
-.stButton > button:active, .stDownloadButton > button:active,
-.stFormSubmitButton > button:active {{ transform:scale(0.98); }}
-.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
+.stButton button:active, .stDownloadButton button:active,
+.stFormSubmitButton button:active {{ transform:scale(0.98); }}
+.stButton button[kind="primary"], .stFormSubmitButton button[kind="primary"],
+button[data-testid="stBaseButton-primary"] {{
   background:{INK} !important; color:#FFFFFF !important;
   border:1px solid {INK} !important;
 }}
-.stButton > button[kind="primary"]:hover {{
+.stButton button[kind="primary"]:hover,
+button[data-testid="stBaseButton-primary"]:hover {{
   background:#2A3550 !important; border-color:#2A3550 !important;
 }}
-.stButton > button[kind="primary"] p {{ color:#FFFFFF !important; }}
-.stButton > button p, .stDownloadButton > button p {{ color:inherit !important; }}
+.stButton button[kind="primary"] p, .stFormSubmitButton button[kind="primary"] p,
+button[data-testid="stBaseButton-primary"] p {{ color:#FFFFFF !important; }}
 @media (prefers-reduced-motion: reduce) {{
   .stButton > button, .stDownloadButton > button,
   .stFormSubmitButton > button {{ transition:none; }}
@@ -886,7 +1033,7 @@ with st.sidebar:
     st.markdown("#### Setup")
     api_key = st.text_input(
         "Gemini API key", type="password",
-        value=os.environ.get("GEMINI_API_KEY", DEFAULT_GEMINI_KEY),
+        value=os.environ.get("GEMINI_API_KEY", ""),
         help="Paste a key from Google AI Studio. The free tier of "
              f"{GEMINI_MODEL} is enough — no billing needed.")
     st.markdown(
@@ -977,7 +1124,6 @@ if run:
     meter, body = parse_meter(raw)
     findings, body = parse_findings(body)
     title, body = parse_title(body, q)
-    body = body + "\n\n" + make_references_md(included)
     for k in [k for k in st.session_state if str(k).startswith("sel_")]:
         del st.session_state[k]        # reset paper selections for the new result
     st.session_state.result = {
@@ -1007,7 +1153,8 @@ if "result" not in st.session_state:
 if "result" in st.session_state:
     r = st.session_state.result
     meter, counts = r["meter"], r["counts"]
-    report_html = render_report_html(r["body"])
+    full_body = r["body"] + "\n\n" + make_references_md(r["included"])
+    report_html = render_report_html(full_body)
 
     st.divider()
     st.markdown(
@@ -1097,3 +1244,87 @@ if "result" in st.session_state:
             disabled=not selected, type="primary")
         if not selected:
             st.caption("Select at least one paper to enable the download.")
+
+    # ---- Follow-up questions: extend the report, never replace it --------
+    st.divider()
+    st.markdown("#### Ask a follow-up")
+    st.caption("Follow-ups run a fresh search and append a new section to "
+               "this report, continuing the same reference numbering.")
+
+    fu_clicked = None
+    suggestions = extract_open_questions(r["body"])
+    if suggestions:
+        scols = st.columns(len(suggestions))
+        for col, sq in zip(scols, suggestions):
+            with col:
+                if st.button(sq[:64] + ("…" if len(sq) > 64 else ""),
+                             key=f"fu_sugg_{abs(hash(sq)) % 10**8}",
+                             help=sq, use_container_width=True):
+                    fu_clicked = sq
+
+    fc1, fc2 = st.columns([3, 1])
+    with fc1:
+        fu_text = st.text_input(
+            "Follow-up question", key="fu_input",
+            label_visibility="collapsed",
+            placeholder="e.g., Which interventions address these barriers?")
+    with fc2:
+        fu_run = st.button("Run follow-up", type="primary",
+                           use_container_width=True)
+
+    fu_q = fu_clicked or (fu_text.strip() if fu_run else "")
+    if fu_q:
+        if not api_key:
+            st.error("Add your Gemini API key in the sidebar to run follow-ups.")
+        else:
+            with st.status(f"Following up: {fu_q[:60]}…", expanded=True) as fst:
+                st.write("Searching ERIC…")
+                f_eric = fetch_eric(fu_q)
+                st.write(f"ERIC returned {len(f_eric)}. Searching OpenAlex…")
+                f_oa = fetch_openalex(fu_q)
+                st.write(f"OpenAlex returned {len(f_oa)}. Searching Semantic Scholar…")
+                f_s2 = fetch_semantic_scholar(fu_q, s2_key)
+                st.write(f"Semantic Scholar returned {len(f_s2)}. Screening…")
+
+                prior_keys = set()
+                for p in r["included"]:
+                    prior_keys.add(re.sub(r"\W+", "", p["title"].lower()))
+                    if p["doi"]:
+                        prior_keys.add(p["doi"].lower())
+                f_all = f_eric + f_oa + f_s2
+                f_screened, f_inc = dedupe_and_screen(
+                    f_all, max_included=12, prior_keys=prior_keys)
+
+                if not f_inc:
+                    fst.update(label="No new papers found", state="error")
+                    st.warning("The follow-up search found no new papers "
+                               "beyond those already in this report. Try "
+                               "different wording — the report is unchanged.")
+                else:
+                    start_n = len(r["included"]) + 1
+                    st.write(f"{len(f_inc)} new papers. Synthesizing addendum…")
+                    try:
+                        addendum = clean_llm_output(synthesize_followup(
+                            api_key, fu_q, r["title"],
+                            build_context(f_inc, start=start_n), start_n))
+                    except Exception as e:
+                        fst.update(label="Follow-up failed", state="error")
+                        st.error(f"Follow-up synthesis failed: {e} — the "
+                                 "report is unchanged.")
+                        addendum = None
+                    if addendum:
+                        if not addendum.lstrip().startswith("## Follow-up"):
+                            addendum = f"## Follow-up: {fu_q}\n\n" + addendum
+                        r["body"] = r["body"].rstrip() + "\n\n" + addendum
+                        r["included"] = r["included"] + f_inc
+                        c = r["counts"]
+                        c["retrieved"] += len(f_all)
+                        c["eric"] += len(f_eric)
+                        c["openalex"] += len(f_oa)
+                        c["s2"] += len(f_s2)
+                        c["screened"] += len(f_screened)
+                        c["included"] = len(r["included"])
+                        fst.update(label="Follow-up added to the report",
+                                   state="complete", expanded=False)
+                        st.session_state.pop("fu_input", None)
+                        st.rerun()
