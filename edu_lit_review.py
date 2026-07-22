@@ -26,17 +26,18 @@ except ImportError:
     md_lib = None
 
 # ==========================================================================
-# Design tokens (shared between the app shell and the HTML export)
+# Design tokens
 # ==========================================================================
 
-INK = "#1B2437"       # deep ink navy — text
-PAPER = "#FAF9F6"     # warm paper ground
+INK = "#1B2437"
+PAPER = "#FAF9F6"
 CARD = "#FFFFFF"
 LINE = "#E7E4DC"
+RULE = "#EEEBE3"      # hairline table rules
 MUTED = "#6E7480"
-GREEN = "#2F6B4F"     # supporting / strong
-AMBER = "#B97D2A"     # mixed / moderate
-RED = "#A44444"       # contradicting / weak
+GREEN = "#2F6B4F"
+AMBER = "#B97D2A"
+RED = "#A44444"
 
 VERDICT_STYLE = {
     "Strong": (GREEN, "Strong consensus"),
@@ -52,12 +53,17 @@ TIMEOUT = 20
 HEADERS = {"User-Agent": "EduLitReview/1.0 (mailto:researcher@example.org)"}
 
 
+def clean_query(q):
+    """Strip punctuation that some APIs reject in search strings."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s-]", " ", q)).strip()
+
+
 def fetch_eric(query):
     papers = []
     try:
         r = requests.get(
             "https://api.ies.ed.gov/eric/",
-            params={"search": query, "format": "json", "rows": 15},
+            params={"search": clean_query(query), "format": "json", "rows": 15},
             headers=HEADERS, timeout=TIMEOUT,
         )
         r.raise_for_status()
@@ -82,7 +88,6 @@ def fetch_eric(query):
 
 
 def _openalex_abstract(inv_idx):
-    """Reconstruct plain text from OpenAlex's abstract_inverted_index."""
     if not inv_idx:
         return ""
     pos = {}
@@ -93,18 +98,24 @@ def _openalex_abstract(inv_idx):
 
 
 def fetch_openalex(query):
+    """Education subfield is 3304 in OpenAlex's topic hierarchy (field 17 is
+    Computer Science). If the filtered call fails, retry unfiltered so the
+    search still returns something."""
     papers = []
+    base_params = {
+        "search": clean_query(query),
+        "per_page": 15,
+        "mailto": "researcher@example.org",
+    }
     try:
         r = requests.get(
             "https://api.openalex.org/works",
-            params={
-                "search": query,
-                "filter": "primary_topic.field.id:17",
-                "per_page": 15,
-                "mailto": "researcher@example.org",
-            },
+            params={**base_params, "filter": "primary_topic.subfield.id:3304"},
             headers=HEADERS, timeout=TIMEOUT,
         )
+        if r.status_code >= 400:          # filter rejected — retry unfiltered
+            r = requests.get("https://api.openalex.org/works",
+                             params=base_params, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         for w in r.json().get("results", []):
             title = w.get("display_name") or ""
@@ -132,18 +143,32 @@ def fetch_openalex(query):
     return papers
 
 
-def fetch_semantic_scholar(query):
+def fetch_semantic_scholar(query, s2_key=""):
+    """Anonymous Semantic Scholar traffic shares one heavily-limited pool, so
+    retry with growing waits; a free API key (optional) lifts the limit."""
     papers = []
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
     params = {
-        "query": query, "limit": 15,
+        "query": clean_query(query), "limit": 15,
         "fields": "title,authors,year,citationCount,abstract,externalIds,tldr",
     }
+    headers = dict(HEADERS)
+    if s2_key:
+        headers["x-api-key"] = s2_key
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code == 429:          # shared free pool — one polite retry
-            time.sleep(3)
-            r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
+        r = None
+        for attempt in range(4):
+            r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+            if r.status_code != 429:
+                break
+            time.sleep(3 * (attempt + 1))     # 3s, 6s, 9s between tries
+        if r is not None and r.status_code == 429:
+            st.warning(
+                "Semantic Scholar is rate-limiting anonymous requests right "
+                "now. Continuing without it — a free API key from "
+                "semanticscholar.org/product/api (added in the sidebar) "
+                "avoids this.")
+            return papers
         r.raise_for_status()
         for p in r.json().get("data", []) or []:
             title = p.get("title") or ""
@@ -169,18 +194,16 @@ def fetch_semantic_scholar(query):
 
 
 # ==========================================================================
-# Screening (PRISMA), grounding context, BibTeX
+# Screening (PRISMA), grounding context, BibTeX, references
 # ==========================================================================
 
 def dedupe_and_screen(all_papers, max_included=25):
-    """Dedupe by DOI/normalized title (screened), then keep papers with usable
-    abstracts, ranked by citation count (included)."""
     seen, screened = set(), []
     for p in all_papers:
         keys = {re.sub(r"\W+", "", p["title"].lower())}
         if p["doi"]:
             keys.add(p["doi"].lower())
-        keys.discard("")                      # never dedupe on an empty key
+        keys.discard("")
         if not keys or not (keys & seen):
             seen |= keys
             screened.append(p)
@@ -227,6 +250,27 @@ def make_bibtex(included):
     return "\n\n".join(entries)
 
 
+def make_references_md(included):
+    """Deterministic reference list built from retrieved metadata only —
+    the LLM never writes this section, so it can't hallucinate it."""
+    lines = ["## References", ""]
+    for i, p in enumerate(included, 1):
+        authors = ", ".join(p["authors"][:6]) or "Unknown authors"
+        if len(p["authors"]) > 6:
+            authors += ", et al."
+        year = p["year"] or "n.d."
+        venue = p["venue"] if p["venue"] not in ("Semantic Scholar",) else ""
+        ref = f"**[{i}]** {authors} ({year}). {p['title']}."
+        if venue:
+            ref += f" *{venue}*."
+        if p["url"]:
+            label = f"doi.org/{p['doi']}" if p["doi"] else "link"
+            ref += f" [{label}]({p['url']})"
+        lines.append(ref)
+        lines.append("")
+    return "\n".join(lines)
+
+
 # ==========================================================================
 # LLM synthesis (Gemini) with strict grounding
 # ==========================================================================
@@ -251,39 +295,48 @@ Line 1 (machine-readable, nothing before it):
 CONSENSUS_METER: <Strong|Moderate/Mixed|Weak> | supporting=<int>% mixed=<int>% contradicting=<int>%
 (Percentages must sum to 100 and reflect your paper-by-paper reading.)
 
+Line 2:
+REPORT_TITLE: <one declarative sentence stating the answer to the question, max 16 words>
+
 Then these five sections:
 
-## 1. Executive Summary & Consensus Meter
-3-4 paragraph summary of what the included literature says about the question,
-an explicit statement of the consensus category and why, and the approximate
-share of papers supporting / mixed / contradicting.
+## 1. Introduction
+2-3 paragraphs: what the included literature says about the question, where
+the evidence is uneven, and an explicit statement of the consensus category
+with the approximate share of papers supporting / mixed / contradicting.
 
-## 2. Methods & PRISMA Search Flow
-Describe the databases searched (ERIC, OpenAlex, Semantic Scholar), the query,
-and the screening logic. Reference the counts provided: retrieved, screened
-(after deduplication), included (with usable abstracts). Note evidence-hierarchy
-weighting (systematic reviews/RCTs > quasi-experimental > correlational >
-qualitative/descriptive).
+## 2. Methods
+One paragraph describing the databases searched (ERIC, OpenAlex, Semantic
+Scholar), the query, and the screening logic, referencing the counts provided
+(retrieved, screened after deduplication, included with usable abstracts).
+Note evidence-hierarchy weighting (systematic reviews/RCTs > quasi-experimental
+> correlational > qualitative/descriptive).
 
-## 3. Key Results & Synthesis
-- A Markdown table "Foundational Anchor Papers" (4-6 rows): Paper [n] | Year |
-  Design (as inferable from abstract) | Core finding | Citations.
-- 2-4 thematic sub-syntheses with ### subheadings, each citing papers.
-- A short "Timeline & Venue Breakdown" paragraph (publication-year spread,
-  notable venues) using only supplied metadata.
+## 3. Results
+### Key Papers
+One short paragraph naming the 3-4 anchor papers and why they anchor the corpus.
+Then a Markdown table (4-6 rows): Paper | Year | Design | Core finding | Citations.
+The Paper column uses bracketed numbers like [3].
+### <Thematic subsection title> (2-4 of these, each 1-2 paragraphs citing papers)
+### Timeline and Venues
+One paragraph on publication-year spread and notable venues, using only the
+supplied metadata.
 
-## 4. Claim Matrix & Methodological Discussion
-- A Markdown table: Claim | Evidence Strength (Strong/Moderate/Weak) |
-  Reasoning | Citations. 4-6 claims.
-- A paragraph on causal vs. descriptive limits of this evidence base.
+## 4. Discussion
+2-3 paragraphs on what the corpus supports best and its causal vs. descriptive
+limits. Then a Markdown table (4-6 rows): Claim | Evidence Strength | Reasoning | Papers.
+The Evidence Strength cell must be EXACTLY one word: Strong, Moderate, or Weak.
 
-## 5. Research Gaps, Emergent Questions & Conclusion
-- A Markdown "Coverage Heatmap" table with rows = the main themes you found and
-  columns = Causal Tests | Long-Term Outcomes | Equity | Generalization; cells =
-  🟢 well covered / 🟡 partial / 🔴 gap, judged strictly from included papers.
-- 3-5 emergent follow-up questions the field has not yet answered.
-- A closing paragraph, including a caution that this reflects only the
-  retrieved records, not the entire literature."""
+## 5. Conclusion
+1-2 closing paragraphs, including a caution that this reflects only the
+retrieved records, not the entire literature.
+### Research Gaps
+One paragraph, then a Markdown coverage table: rows = the main themes you found;
+columns = Theme | Causal Tests | Long-Term Outcomes | Equity | Generalization.
+Every non-Theme cell must be EXACTLY one word: Covered, Partial, or Gap —
+judged strictly from the included papers.
+### Open Research Questions
+A Markdown table (3-5 rows): Question | Why It Matters."""
 
 GEMINI_MODEL = "gemini-3.5-flash"  # has a free tier as of mid-2026
 
@@ -301,12 +354,10 @@ def synthesize(api_key, question, context, counts):
         f"INCLUDED PAPERS (your ONLY evidence base):\n\n{context}\n\n"
         f"{REPORT_INSTRUCTIONS}"
     )
-    # Note: thinking tokens count toward the output cap on this model,
-    # so the cap is set generously to avoid truncated reports.
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT, max_output_tokens=16000)
     last_err = None
-    for attempt in range(3):  # free-tier RPM limits can trigger transient 429s
+    for attempt in range(3):
         try:
             resp = client.models.generate_content(
                 model=GEMINI_MODEL, contents=user_msg, config=config)
@@ -327,7 +378,6 @@ def synthesize(api_key, question, context, counts):
 
 
 def clean_llm_output(text):
-    """Strip code fences and stray whitespace Gemini sometimes adds."""
     t = text.strip()
     t = re.sub(r"^```(?:markdown|md)?\s*\n?", "", t)
     t = re.sub(r"\n?```\s*$", "", t)
@@ -335,14 +385,13 @@ def clean_llm_output(text):
 
 
 def parse_meter(report):
-    """Extract the CONSENSUS_METER line. Returns (meter|None, body)."""
     m = re.search(
         r"CONSENSUS_METER:\s*(Strong|Moderate/Mixed|Weak)\s*\|\s*"
         r"supporting=(\d+)%\s*mixed=(\d+)%\s*contradicting=(\d+)%", report)
     if not m:
         return None, report
     s, x, c = int(m.group(2)), int(m.group(3)), int(m.group(4))
-    total = max(s + x + c, 1)                    # normalize so the bar never overflows
+    total = max(s + x + c, 1)
     meter = {
         "category": m.group(1),
         "supporting": s, "mixed": x, "contradicting": c,
@@ -350,27 +399,62 @@ def parse_meter(report):
         "w_mix": round(x / total * 100, 1),
         "w_con": round(c / total * 100, 1),
     }
-    return meter, report[m.end():].lstrip()      # drop preamble AND meter line
+    return meter, report[m.end():].lstrip()
+
+
+def parse_title(body, fallback):
+    m = re.search(r"^REPORT_TITLE:\s*(.+?)\s*$", body, flags=re.MULTILINE)
+    if not m:
+        return fallback, body
+    title = m.group(1).strip().strip("*").rstrip(".")
+    return title or fallback, (body[:m.start()] + body[m.end():]).lstrip()
 
 
 # ==========================================================================
-# Shared HTML fragments (verdict hero, PRISMA flow) — used in-app and in export
+# Report rendering — one pipeline used both in-app and in the HTML export
 # ==========================================================================
+
+def _strength_meter_cell(word):
+    fills = {"Strong": (8, GREEN), "Moderate": (6, AMBER), "Weak": (2, RED)}
+    n, color = fills[word]
+    segs = "".join(
+        f'<i style="background:{color}"></i>' if k < n else "<i></i>"
+        for k in range(10))
+    return (f'<td class="strength"><span class="meter10">{segs}</span>'
+            f'<span class="meter-word" style="color:{color}">{word}</span></td>')
+
+
+def render_report_html(body_md):
+    """Markdown -> Consensus-styled HTML: segmented strength meters in the
+    claim matrix, tinted coverage cells in the gaps heatmap."""
+    # tolerate emoji heatmap cells from older prompts
+    body_md = (body_md.replace("🟢", "Covered").replace("🟡", "Partial")
+               .replace("🔴", "Gap"))
+    if not md_lib:
+        return ("<pre style='white-space:pre-wrap'>"
+                + html_lib.escape(body_md) + "</pre>")
+    h = md_lib.markdown(body_md, extensions=["tables", "sane_lists"])
+    for word in ("Strong", "Moderate", "Weak"):
+        h = h.replace(f"<td>{word}</td>", _strength_meter_cell(word))
+    h = h.replace('<td>Moderate/Mixed</td>', _strength_meter_cell("Moderate"))
+    for word, cls in (("Covered", "cov"), ("Partial", "par"), ("Gap", "gap")):
+        h = h.replace(f"<td>{word}</td>", f'<td class="hm hm-{cls}">{word}</td>')
+    return h
+
 
 def verdict_html(meter):
     if not meter:
         return ""
     color, label = VERDICT_STYLE.get(meter["category"], (MUTED, meter["category"]))
-    seg = ('<span class="vseg" style="width:{w}%;background:{c}" '
-           'title="{t} {p}%"></span>')
+    seg = ('<span class="vseg" style="width:{w}%;background:{c}"></span>')
     return (
         '<div class="verdict">'
         '<div class="verdict-eyebrow">Consensus meter</div>'
         f'<div class="verdict-cat" style="color:{color}">{label}</div>'
         '<div class="vbar">'
-        + seg.format(w=meter["w_sup"], c=GREEN, t="Supporting", p=meter["supporting"])
-        + seg.format(w=meter["w_mix"], c=AMBER, t="Mixed", p=meter["mixed"])
-        + seg.format(w=meter["w_con"], c=RED, t="Contradicting", p=meter["contradicting"])
+        + seg.format(w=meter["w_sup"], c=GREEN)
+        + seg.format(w=meter["w_mix"], c=AMBER)
+        + seg.format(w=meter["w_con"], c=RED)
         + "</div>"
         '<div class="vlegend">'
         f'<span><i style="background:{GREEN}"></i>Supporting {meter["supporting"]}%</span>'
@@ -382,13 +466,19 @@ def verdict_html(meter):
 
 def prisma_html(counts):
     card = ('<div class="prisma-card"><div class="prisma-n">{n}</div>'
-            '<div class="prisma-l">{label}</div></div>')
+            '<div class="prisma-l">{label}</div><div class="prisma-s">{sub}</div></div>')
     arrow = '<div class="prisma-arrow">&#8594;</div>'
     return (
         '<div class="prisma-flow">'
-        + card.format(n=counts["retrieved"], label="Retrieved") + arrow
-        + card.format(n=counts["screened"], label="Screened &middot; deduplicated") + arrow
-        + card.format(n=counts["included"], label="Included in synthesis")
+        + card.format(n=counts["retrieved"], label="Retrieved",
+                      sub=f'ERIC {counts["eric"]} &middot; OpenAlex '
+                          f'{counts["openalex"]} &middot; S2 {counts["s2"]}')
+        + arrow
+        + card.format(n=counts["screened"], label="Screened",
+                      sub="After deduplication")
+        + arrow
+        + card.format(n=counts["included"], label="Included",
+                      sub="Usable abstracts, ranked by citations")
         + "</div>"
     )
 
@@ -414,247 +504,252 @@ def papers_html(included):
             f'<div class="paper-title">{title_el}</div>'
             f'<div class="paper-meta">{authors or "Unknown authors"}</div>'
             f'<div class="paper-meta">{" &middot; ".join(meta)}'
-            f'<span class="src src-{p["source"].split()[0].lower()}">{p["source"]}</span>'
+            f'<span class="src">{p["source"]}</span>'
             "</div></div></div>"
         )
     return '<div class="paper-list">' + "".join(items) + "</div>"
 
 
-# ==========================================================================
-# HTML export (print-ready)
-# ==========================================================================
+# --- Report CSS, scoped to .report-doc, shared by app and export ----------
 
-def _tag_strengths(body):
-    """Wrap Strong/Moderate/Weak table cells in Consensus-style badge tags."""
-    for word, cls in (("Moderate/Mixed", "moderate"), ("Strong", "strong"),
-                      ("Moderate", "moderate"), ("Weak", "weak")):
-        body = body.replace(f"<td>{word}</td>",
-                            f'<td><span class="tag tag-{cls}">{word}</span></td>')
-    return body
+REPORT_CSS = f"""
+.report-doc {{ font-family:'Public Sans',system-ui,sans-serif; color:{INK};
+  font-size:.95rem; line-height:1.7; }}
+.report-doc h2 {{ font-family:'Public Sans',sans-serif; font-weight:700;
+  font-size:1.12rem; color:{INK}; margin:2.6em 0 .7em; letter-spacing:0; }}
+.report-doc h2:first-child {{ margin-top:.6em; }}
+.report-doc h3 {{ font-family:'Public Sans',sans-serif; font-weight:700;
+  font-size:.95rem; color:{INK}; margin:1.9em 0 .5em; }}
+.report-doc p {{ margin:.75em 0; }}
+.report-doc a {{ color:{GREEN}; }}
+.report-doc table {{ border-collapse:collapse; width:100%; margin:18px 0 26px;
+  font-size:.88rem; }}
+.report-doc th {{ text-align:left; font-size:.75rem; font-weight:700;
+  color:{INK}; padding:0 18px 10px 0; border-bottom:1px solid {LINE};
+  vertical-align:bottom; }}
+.report-doc td {{ padding:13px 18px 13px 0; border-bottom:1px solid {RULE};
+  vertical-align:top; }}
+.report-doc td:last-child, .report-doc th:last-child {{ padding-right:0; }}
+.report-doc .strength {{ white-space:nowrap; }}
+.report-doc .meter10 {{ display:inline-flex; gap:2px; vertical-align:middle; }}
+.report-doc .meter10 i {{ display:inline-block; width:6px; height:15px;
+  border-radius:2px; background:{LINE}; }}
+.report-doc .meter-word {{ display:block; font-family:'IBM Plex Mono',monospace;
+  font-size:.68rem; font-weight:600; margin-top:5px; }}
+.report-doc .hm {{ font-family:'IBM Plex Mono',monospace; font-size:.72rem;
+  font-weight:600; text-align:center; border-radius:6px; }}
+.report-doc td.hm {{ padding:13px 10px; }}
+.report-doc .hm-cov {{ background:#E9F1EB; color:{GREEN}; }}
+.report-doc .hm-par {{ background:#F6EDDD; color:{AMBER}; }}
+.report-doc .hm-gap {{ background:#F5E7E7; color:{RED}; }}
 
-
-def build_html_export(question, meter, report_md, counts):
-    q = html_lib.escape(question)
-    if md_lib:
-        body = md_lib.markdown(report_md, extensions=["tables", "sane_lists"])
-        body = _tag_strengths(body)
-    else:  # graceful fallback if the markdown package is missing
-        body = "<pre style='white-space:pre-wrap'>" + html_lib.escape(report_md) + "</pre>"
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Deep Search Report — {q}</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
-  :root {{
-    --ink:{INK}; --paper:{PAPER}; --card:{CARD}; --line:{LINE}; --muted:{MUTED};
-    --green:{GREEN}; --amber:{AMBER}; --red:{RED};
-  }}
-  * {{ box-sizing:border-box; }}
-  body {{ font-family:'Public Sans',system-ui,-apple-system,sans-serif;
-         color:var(--ink); background:var(--paper); margin:0; line-height:1.65;
-         font-size:15.5px; }}
-  .wrap {{ max-width:860px; margin:0 auto; padding:48px 24px; }}
-  .report {{ background:var(--card); border:1px solid var(--line);
-             border-radius:14px; padding:52px 56px;
-             box-shadow:0 1px 3px rgba(27,36,55,.05); }}
-  .eyebrow {{ font-family:'IBM Plex Mono',monospace; font-size:.72rem;
-              letter-spacing:.14em; text-transform:uppercase; color:var(--muted);
-              margin-bottom:14px; }}
-  h1 {{ font-family:'Fraunces',Georgia,serif; font-weight:600; font-size:2rem;
-        line-height:1.25; margin:0 0 8px; letter-spacing:-.01em; }}
-  .subtitle {{ color:var(--muted); font-size:.88rem; margin-bottom:28px;
-               padding-bottom:24px; border-bottom:1px solid var(--line); }}
-  h2 {{ font-family:'Fraunces',Georgia,serif; font-weight:600; font-size:1.35rem;
-        margin:2.4em 0 .6em; letter-spacing:-.01em; }}
-  h3 {{ font-weight:600; font-size:1.02rem; margin-top:1.7em; }}
-  p {{ margin:.7em 0; }}
-  a {{ color:var(--green); }}
-  table {{ border-collapse:collapse; width:100%; font-size:.88rem; margin:16px 0; }}
-  th, td {{ border:1px solid var(--line); padding:9px 11px; text-align:left;
-            vertical-align:top; }}
-  th {{ background:#F4F2EC; font-family:'IBM Plex Mono',monospace;
-        font-size:.72rem; letter-spacing:.06em; text-transform:uppercase;
-        color:var(--muted); font-weight:600; }}
-  tr:nth-child(even) td {{ background:#FBFAF7; }}
-  .tag {{ display:inline-block; font-family:'IBM Plex Mono',monospace;
-          font-size:.72rem; font-weight:600; padding:2px 10px;
-          border-radius:999px; color:#fff; }}
-  .tag-strong {{ background:var(--green); }}
-  .tag-moderate {{ background:var(--amber); }}
-  .tag-weak {{ background:var(--red); }}
-  .verdict {{ margin:6px 0 26px; }}
-  .verdict-eyebrow {{ font-family:'IBM Plex Mono',monospace; font-size:.72rem;
-                      letter-spacing:.14em; text-transform:uppercase;
-                      color:var(--muted); margin-bottom:4px; }}
-  .verdict-cat {{ font-family:'Fraunces',Georgia,serif; font-weight:600;
-                  font-size:1.7rem; letter-spacing:-.01em; margin-bottom:12px; }}
-  .vbar {{ display:flex; height:14px; border-radius:7px; overflow:hidden;
-           background:var(--line); }}
-  .vseg {{ display:block; height:100%; }}
-  .vlegend {{ display:flex; gap:18px; flex-wrap:wrap; margin-top:10px;
-              font-family:'IBM Plex Mono',monospace; font-size:.76rem;
-              color:var(--muted); }}
-  .vlegend i {{ display:inline-block; width:9px; height:9px; border-radius:50%;
-                margin-right:6px; }}
-  .prisma-flow {{ display:flex; align-items:stretch; gap:12px; flex-wrap:wrap;
-                  margin:0 0 8px; }}
-  .prisma-card {{ border:1px solid var(--line); border-radius:12px;
-                  padding:16px 24px; text-align:center; background:#FCFBF8;
-                  min-width:150px; flex:1; }}
-  .prisma-n {{ font-family:'IBM Plex Mono',monospace; font-size:1.7rem;
-               font-weight:600; color:var(--ink); }}
-  .prisma-l {{ font-size:.78rem; color:var(--muted); margin-top:2px; }}
-  .prisma-arrow {{ align-self:center; font-size:1.3rem; color:#B9B4A8; }}
-  @media (max-width:640px) {{
-    .report {{ padding:28px 20px; }}
-    .prisma-arrow {{ display:none; }}
-  }}
-  @media print {{
-    body {{ background:#fff; font-size:12.5px; }}
-    .wrap {{ max-width:100%; padding:0; }}
-    .report {{ border:none; box-shadow:none; padding:0; border-radius:0; }}
-    h1 {{ font-size:1.6rem; }}
-    h2 {{ break-after:avoid; }}
-    table, .prisma-flow, .verdict {{ break-inside:avoid; }}
-    a {{ color:var(--ink); text-decoration:none; }}
-  }}
-</style>
-</head>
-<body><div class="wrap"><div class="report">
-<div class="eyebrow">Deep Search Report &middot; ERIC &middot; OpenAlex &middot; Semantic Scholar</div>
-<h1>{q}</h1>
-<div class="subtitle">Generated {date.today().strftime("%B %d, %Y")} &middot;
-{counts["included"]} papers synthesized from {counts["retrieved"]} retrieved records</div>
-{verdict_html(meter)}
-{prisma_html(counts)}
-{body}
-</div></div></body></html>"""
-
-
-# ==========================================================================
-# App shell CSS (injected once, styles the whole Streamlit app)
-# ==========================================================================
-
-APP_CSS = f"""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
-
-.stApp {{ background:{PAPER}; }}
-.block-container {{ max-width:980px; padding-top:2.6rem; }}
-
-html, body, .stApp, .stMarkdown, p, li, td {{
-  font-family:'Public Sans',system-ui,-apple-system,sans-serif;
-  color:{INK};
-}}
-h1, h2, h3, .stMarkdown h1, .stMarkdown h2 {{
-  font-family:'Fraunces',Georgia,serif !important;
-  font-weight:600 !important; letter-spacing:-.01em;
-  color:{INK} !important;
-}}
-.stMarkdown h2 {{ font-size:1.4rem; margin-top:1.6em; }}
-.stMarkdown h3 {{ font-family:'Public Sans',sans-serif !important;
-                  font-weight:600 !important; font-size:1.03rem; }}
-
-/* Header */
-.app-eyebrow {{ font-family:'IBM Plex Mono',monospace; font-size:.72rem;
-  letter-spacing:.16em; text-transform:uppercase; color:{MUTED};
-  margin-bottom:.4rem; }}
-.app-title {{ font-family:'Fraunces',Georgia,serif; font-weight:600;
-  font-size:2.1rem; line-height:1.2; letter-spacing:-.01em; margin:0; }}
-.app-sub {{ color:{MUTED}; font-size:.95rem; margin:.5rem 0 0; }}
-
-/* Sidebar */
-[data-testid="stSidebar"] {{ background:#F3F1EB; border-right:1px solid {LINE}; }}
-[data-testid="stSidebar"] .stMarkdown p {{ font-size:.86rem; color:{MUTED}; }}
-
-/* Buttons — press feedback, no sluggish transitions */
-.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
-  border-radius:10px; font-weight:600;
-  transition:transform 120ms cubic-bezier(0.23,1,0.32,1),
-             background 150ms ease;
-}}
-.stButton > button:active, .stDownloadButton > button:active,
-.stFormSubmitButton > button:active {{ transform:scale(0.98); }}
-.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
-  background:{INK}; border:1px solid {INK};
-}}
-.stButton > button[kind="primary"]:hover,
-.stFormSubmitButton > button[kind="primary"]:hover {{
-  background:#2A3550; border-color:#2A3550;
-}}
-@media (prefers-reduced-motion: reduce) {{
-  .stButton > button, .stDownloadButton > button,
-  .stFormSubmitButton > button {{ transition:none; }}
-}}
-
-/* Report tables rendered by st.markdown */
-.stMarkdown table {{ border-collapse:collapse; width:100%; font-size:.88rem; }}
-.stMarkdown th, .stMarkdown td {{ border:1px solid {LINE}; padding:8px 11px;
-  text-align:left; vertical-align:top; }}
-.stMarkdown th {{ background:#F4F2EC; font-family:'IBM Plex Mono',monospace;
-  font-size:.72rem; letter-spacing:.06em; text-transform:uppercase;
-  color:{MUTED}; }}
-.stMarkdown tr:nth-child(even) td {{ background:#FBFAF7; }}
-
-/* Verdict hero */
 .verdict {{ background:{CARD}; border:1px solid {LINE}; border-radius:14px;
-  padding:22px 26px; margin-bottom:14px;
+  padding:22px 26px; margin:4px 0 14px;
   box-shadow:0 1px 3px rgba(27,36,55,.05); }}
-.verdict-eyebrow {{ font-family:'IBM Plex Mono',monospace; font-size:.72rem;
+.verdict-eyebrow {{ font-family:'IBM Plex Mono',monospace; font-size:.7rem;
   letter-spacing:.14em; text-transform:uppercase; color:{MUTED};
   margin-bottom:2px; }}
 .verdict-cat {{ font-family:'Fraunces',Georgia,serif; font-weight:600;
-  font-size:1.65rem; letter-spacing:-.01em; margin-bottom:12px; }}
-.vbar {{ display:flex; height:14px; border-radius:7px; overflow:hidden;
+  font-size:1.6rem; letter-spacing:-.01em; margin-bottom:12px; }}
+.vbar {{ display:flex; height:13px; border-radius:7px; overflow:hidden;
   background:{LINE}; }}
 .vseg {{ display:block; height:100%; }}
 .vlegend {{ display:flex; gap:18px; flex-wrap:wrap; margin-top:10px;
-  font-family:'IBM Plex Mono',monospace; font-size:.76rem; color:{MUTED}; }}
+  font-family:'IBM Plex Mono',monospace; font-size:.74rem; color:{MUTED}; }}
 .vlegend i {{ display:inline-block; width:9px; height:9px; border-radius:50%;
   margin-right:6px; }}
 
-/* PRISMA flow */
 .prisma-flow {{ display:flex; align-items:stretch; gap:12px; flex-wrap:wrap;
-  margin:0 0 6px; }}
-.prisma-card {{ border:1px solid {LINE}; border-radius:12px; padding:14px 22px;
-  text-align:center; background:{CARD}; min-width:140px; flex:1;
+  margin:0 0 8px; }}
+.prisma-card {{ border:1px solid {LINE}; border-radius:12px; padding:15px 22px;
+  background:{CARD}; min-width:170px; flex:1;
   box-shadow:0 1px 3px rgba(27,36,55,.04); }}
 .prisma-n {{ font-family:'IBM Plex Mono',monospace; font-size:1.6rem;
   font-weight:600; color:{INK}; }}
-.prisma-l {{ font-size:.78rem; color:{MUTED}; margin-top:2px; }}
+.prisma-l {{ font-size:.82rem; font-weight:600; color:{INK}; margin-top:1px; }}
+.prisma-s {{ font-size:.73rem; color:{MUTED}; margin-top:2px; }}
 .prisma-arrow {{ align-self:center; font-size:1.3rem; color:#B9B4A8; }}
 
-/* How-it-works cards (empty state) */
-.how-row {{ display:flex; gap:14px; flex-wrap:wrap; margin-top:6px; }}
-.how-card {{ flex:1; min-width:200px; background:{CARD}; border:1px solid {LINE};
-  border-radius:12px; padding:18px 20px;
-  box-shadow:0 1px 3px rgba(27,36,55,.04); }}
-.how-step {{ font-family:'IBM Plex Mono',monospace; font-size:.7rem;
-  letter-spacing:.12em; text-transform:uppercase; color:{MUTED}; }}
-.how-title {{ font-weight:600; margin:6px 0 4px; }}
-.how-body {{ font-size:.85rem; color:{MUTED}; line-height:1.5; }}
-
-/* Paper list */
 .paper-list {{ display:flex; flex-direction:column; gap:10px; }}
 .paper {{ display:flex; gap:14px; background:{CARD}; border:1px solid {LINE};
   border-radius:12px; padding:14px 18px; }}
 .paper-n {{ font-family:'IBM Plex Mono',monospace; font-weight:600;
   color:{MUTED}; font-size:.85rem; min-width:34px; }}
-.paper-title {{ font-weight:600; line-height:1.4; margin-bottom:2px; }}
+.paper-title {{ font-weight:600; line-height:1.4; margin-bottom:2px; color:{INK}; }}
 .paper-title a {{ color:{INK}; text-decoration:none; }}
 .paper-title a:hover {{ color:{GREEN}; text-decoration:underline; }}
 .paper-meta {{ font-size:.82rem; color:{MUTED}; }}
-.src {{ font-family:'IBM Plex Mono',monospace; font-size:.68rem;
+.src {{ font-family:'IBM Plex Mono',monospace; font-size:.66rem;
   font-weight:600; padding:1px 8px; border-radius:999px; margin-left:8px;
   border:1px solid {LINE}; color:{MUTED}; background:#F6F4EF; }}
+"""
 
+
+def build_html_export(title, question, meter, report_html, counts):
+    t, q = html_lib.escape(title), html_lib.escape(question)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{t}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
+  * {{ box-sizing:border-box; }}
+  body {{ font-family:'Public Sans',system-ui,sans-serif; color:{INK};
+         background:{PAPER}; margin:0; }}
+  .wrap {{ max-width:840px; margin:0 auto; padding:48px 24px; }}
+  .sheet {{ background:{CARD}; border:1px solid {LINE}; border-radius:14px;
+            padding:56px 60px; box-shadow:0 1px 3px rgba(27,36,55,.05); }}
+  .brand {{ font-family:'IBM Plex Mono',monospace; font-size:.7rem;
+            letter-spacing:.15em; text-transform:uppercase; color:{MUTED};
+            margin-bottom:18px; }}
+  h1.headline {{ font-family:'Fraunces',Georgia,serif; font-weight:600;
+       font-size:1.85rem; line-height:1.3; margin:0 0 10px;
+       letter-spacing:-.01em; }}
+  .subtitle {{ color:{MUTED}; font-size:.88rem; margin-bottom:30px;
+               padding-bottom:26px; border-bottom:1px solid {LINE}; }}
+  .footer {{ margin-top:44px; padding-top:20px; border-top:1px solid {LINE};
+             font-size:.78rem; color:{MUTED}; font-style:italic; }}
+  {REPORT_CSS}
+  @media (max-width:640px) {{
+    .sheet {{ padding:28px 20px; }}
+    .prisma-arrow {{ display:none; }}
+  }}
+  @media print {{
+    body {{ background:#fff; font-size:12.5px; }}
+    .wrap {{ max-width:100%; padding:0; }}
+    .sheet {{ border:none; box-shadow:none; padding:0; border-radius:0; }}
+    h1.headline {{ font-size:1.55rem; }}
+    .report-doc h2 {{ break-after:avoid; }}
+    .report-doc table, .prisma-flow, .verdict {{ break-inside:avoid; }}
+    a {{ color:{INK}; text-decoration:none; }}
+  }}
+</style>
+</head>
+<body><div class="wrap"><div class="sheet">
+<div class="brand">Deep Search Report &middot; ERIC &middot; OpenAlex &middot; Semantic Scholar</div>
+<h1 class="headline">{t}</h1>
+<div class="subtitle">{q} &middot; Generated {date.today().strftime("%B %d, %Y")}
+ &middot; {counts["included"]} papers synthesized from {counts["retrieved"]} retrieved records</div>
+{verdict_html(meter)}
+{prisma_html(counts)}
+<div class="report-doc">
+{report_html}
+</div>
+<div class="footer">Generated with the Education Literature Review Assistant.
+Every citation refers to the numbered References list above, built directly
+from the retrieved records.</div>
+</div></div></body></html>"""
+
+
+# ==========================================================================
+# App shell CSS — explicit light styling so dark browser themes can't break it
+# ==========================================================================
+
+APP_CSS = f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+.stApp, [data-testid="stAppViewContainer"] {{ background:{PAPER}; }}
+[data-testid="stHeader"] {{ background:{PAPER}; }}
+.block-container {{ max-width:960px; padding-top:2.4rem; }}
+
+html, body, .stApp, .stMarkdown, .stMarkdown p, .stMarkdown li,
+[data-testid="stWidgetLabel"] p, [data-testid="stCaptionContainer"],
+[data-testid="stText"] {{
+  font-family:'Public Sans',system-ui,sans-serif; color:{INK};
+}}
+[data-testid="stCaptionContainer"], .stCaption {{ color:{MUTED} !important; }}
+
+h1, h2, h3, .stMarkdown h1, .stMarkdown h2 {{
+  font-family:'Fraunces',Georgia,serif !important;
+  font-weight:600 !important; letter-spacing:-.01em; color:{INK} !important;
+}}
+
+/* Header */
+.app-eyebrow {{ font-family:'IBM Plex Mono',monospace; font-size:.7rem;
+  letter-spacing:.16em; text-transform:uppercase; color:{MUTED};
+  margin-bottom:.4rem; }}
+.app-title {{ font-family:'Fraunces',Georgia,serif; font-weight:600;
+  font-size:2rem; line-height:1.2; letter-spacing:-.01em; margin:0;
+  color:{INK}; }}
+.app-sub {{ color:{MUTED}; font-size:.95rem; margin:.5rem 0 0; }}
+
+/* Sidebar */
+[data-testid="stSidebar"] {{ background:#F3F1EB; border-right:1px solid {LINE}; }}
+[data-testid="stSidebar"] * {{ color:{INK}; }}
+[data-testid="stSidebar"] .stMarkdown p {{ font-size:.86rem; color:#565D6B; }}
+[data-testid="stSidebar"] a {{ color:{GREEN} !important; }}
+
+/* Inputs — forced light so they're readable in any browser theme */
+.stTextArea textarea, .stTextInput input {{
+  background:{CARD} !important; color:{INK} !important;
+  border:1px solid {LINE} !important; border-radius:10px !important;
+  caret-color:{INK};
+}}
+.stTextArea textarea::placeholder, .stTextInput input::placeholder {{
+  color:#9AA0AB !important; opacity:1;
+}}
+.stTextArea [data-baseweb="textarea"], .stTextInput [data-baseweb="input"],
+.stTextArea [data-baseweb="base-input"], .stTextInput [data-baseweb="base-input"] {{
+  background:{CARD} !important; border-color:{LINE} !important;
+}}
+
+/* Buttons — explicit colors + press feedback */
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{
+  background:{CARD} !important; color:{INK} !important;
+  border:1px solid {LINE} !important; border-radius:10px; font-weight:600;
+  transition:transform 120ms cubic-bezier(0.23,1,0.32,1),
+             background 150ms ease, border-color 150ms ease;
+}}
+.stButton > button:hover, .stDownloadButton > button:hover {{
+  border-color:{INK} !important;
+}}
+.stButton > button:active, .stDownloadButton > button:active,
+.stFormSubmitButton > button:active {{ transform:scale(0.98); }}
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
+  background:{INK} !important; color:#FFFFFF !important;
+  border:1px solid {INK} !important;
+}}
+.stButton > button[kind="primary"]:hover {{
+  background:#2A3550 !important; border-color:#2A3550 !important;
+}}
+.stButton > button[kind="primary"] p {{ color:#FFFFFF !important; }}
+.stButton > button p, .stDownloadButton > button p {{ color:inherit !important; }}
+@media (prefers-reduced-motion: reduce) {{
+  .stButton > button, .stDownloadButton > button,
+  .stFormSubmitButton > button {{ transition:none; }}
+}}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {{ gap:2px; border-bottom:1px solid {LINE}; }}
+.stTabs [data-baseweb="tab"] {{ color:{MUTED}; font-weight:600; }}
+.stTabs [aria-selected="true"] {{ color:{INK} !important; }}
+.stTabs [data-baseweb="tab-highlight"] {{ background:{INK}; }}
+
+/* Status / expander */
+[data-testid="stExpander"] {{ background:{CARD}; border:1px solid {LINE};
+  border-radius:12px; }}
+[data-testid="stExpander"] summary, [data-testid="stExpander"] p {{ color:{INK}; }}
+
+/* How-it-works cards */
+.how-row {{ display:flex; gap:14px; flex-wrap:wrap; margin-top:6px; }}
+.how-card {{ flex:1; min-width:200px; background:{CARD}; border:1px solid {LINE};
+  border-radius:12px; padding:18px 20px;
+  box-shadow:0 1px 3px rgba(27,36,55,.04); }}
+.how-step {{ font-family:'IBM Plex Mono',monospace; font-size:.68rem;
+  letter-spacing:.12em; text-transform:uppercase; color:{MUTED}; }}
+.how-title {{ font-weight:600; margin:6px 0 4px; color:{INK}; }}
+.how-body {{ font-size:.85rem; color:{MUTED}; line-height:1.5; }}
+
+/* Result header */
 .result-head {{ margin:4px 0 14px; }}
-.result-q {{ font-family:'Fraunces',Georgia,serif; font-weight:600;
-  font-size:1.5rem; line-height:1.3; letter-spacing:-.01em; }}
-.result-meta {{ font-size:.85rem; color:{MUTED}; margin-top:4px; }}
+.result-title {{ font-family:'Fraunces',Georgia,serif; font-weight:600;
+  font-size:1.55rem; line-height:1.3; letter-spacing:-.01em; color:{INK}; }}
+.result-meta {{ font-size:.85rem; color:{MUTED}; margin-top:6px; }}
+
+{REPORT_CSS}
 </style>
 """
 
@@ -677,7 +772,6 @@ def _set_example(text):
     st.session_state.q_input = text
 
 
-# ---- Sidebar: setup only ------------------------------------------------
 with st.sidebar:
     st.markdown("#### Setup")
     api_key = st.text_input(
@@ -688,6 +782,12 @@ with st.sidebar:
     st.markdown(
         "[Get a free key at aistudio.google.com/apikey]"
         "(https://aistudio.google.com/apikey)")
+    s2_key = st.text_input(
+        "Semantic Scholar API key (optional)", type="password",
+        value=os.environ.get("S2_API_KEY", ""),
+        help="Anonymous Semantic Scholar requests share one rate limit and "
+             "often fail. A free key from semanticscholar.org/product/api "
+             "makes that source reliable.")
     st.divider()
     st.markdown("#### About")
     st.markdown(
@@ -696,7 +796,6 @@ with st.sidebar:
         "claim is cited to a retrieved paper — the model is not allowed to "
         "use outside knowledge.")
 
-# ---- Header + question --------------------------------------------------
 st.markdown(
     '<div class="app-eyebrow">ERIC &middot; OpenAlex &middot; Semantic Scholar</div>'
     '<p class="app-title">Education Literature Review Assistant</p>'
@@ -721,7 +820,6 @@ with ec1:
 with ec2:
     run = st.button("Run deep search", type="primary", use_container_width=True)
 
-# ---- Run pipeline -------------------------------------------------------
 if run:
     if not question.strip():
         st.error("Type a research question first — or tap one of the examples.")
@@ -738,7 +836,7 @@ if run:
         st.write(f"ERIC returned {len(eric)}. Searching OpenAlex…")
         oa = fetch_openalex(q)
         st.write(f"OpenAlex returned {len(oa)}. Searching Semantic Scholar…")
-        s2 = fetch_semantic_scholar(q)
+        s2 = fetch_semantic_scholar(q, s2_key)
         st.write(f"Semantic Scholar returned {len(s2)}. Screening and deduplicating…")
 
         all_papers = eric + oa + s2
@@ -765,12 +863,13 @@ if run:
         status.update(label="Report ready", state="complete", expanded=False)
 
     meter, body = parse_meter(raw)
+    title, body = parse_title(body, q)
+    body = body + "\n\n" + make_references_md(included)
     st.session_state.result = {
-        "question": q, "meter": meter, "body": body,
+        "question": q, "title": title, "meter": meter, "body": body,
         "counts": counts, "included": included,
     }
 
-# ---- Empty state --------------------------------------------------------
 if "result" not in st.session_state:
     st.write("")
     st.markdown(
@@ -790,17 +889,18 @@ if "result" not in st.session_state:
         "</div>",
         unsafe_allow_html=True)
 
-# ---- Results ------------------------------------------------------------
 if "result" in st.session_state:
     r = st.session_state.result
     meter, counts = r["meter"], r["counts"]
+    report_html = render_report_html(r["body"])
 
     st.divider()
     st.markdown(
         '<div class="result-head">'
-        f'<div class="result-q">{html_lib.escape(r["question"])}</div>'
-        f'<div class="result-meta">Generated {date.today().strftime("%B %d, %Y")}'
-        f' &middot; {counts["included"]} papers synthesized from '
+        f'<div class="result-title">{html_lib.escape(r["title"])}</div>'
+        f'<div class="result-meta">{html_lib.escape(r["question"])} &middot; '
+        f'Generated {date.today().strftime("%B %d, %Y")} &middot; '
+        f'{counts["included"]} papers synthesized from '
         f'{counts["retrieved"]} retrieved records</div></div>',
         unsafe_allow_html=True)
 
@@ -816,7 +916,8 @@ if "result" in st.session_state:
         ["Report", f"Included papers ({counts['included']})", "Export"])
 
     with tab_report:
-        st.markdown(r["body"])
+        st.markdown(f'<div class="report-doc">{report_html}</div>',
+                    unsafe_allow_html=True)
 
     with tab_papers:
         st.markdown(
@@ -826,7 +927,8 @@ if "result" in st.session_state:
 
     with tab_export:
         bib = make_bibtex(r["included"])
-        html_out = build_html_export(r["question"], meter, r["body"], counts)
+        html_out = build_html_export(r["title"], r["question"], meter,
+                                     report_html, counts)
         d1, d2 = st.columns(2)
         with d1:
             st.download_button(
