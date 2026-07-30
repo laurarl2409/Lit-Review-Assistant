@@ -7,7 +7,8 @@ strict grounding rules, and renders a Consensus.app-style Deep Search Report
 with BibTeX and print-ready HTML export.
 
 Run:
-    pip install streamlit requests google-genai markdown
+    pip install streamlit requests
+    # optional: markdown (nicer tables), google-genai (Gemini SDK)
     streamlit run edu_lit_review.py
 """
 
@@ -29,25 +30,81 @@ except ImportError:
 # Design tokens
 # ==========================================================================
 
-INK = "#1B2437"
-PAPER = "#FAF9F6"
-CARD = "#FFFFFF"
-LINE = "#E7E4DC"
-RULE = "#EEEBE3"      # hairline table rules
-MUTED = "#6E7480"
-GREEN = "#2F6B4F"
-AMBER = "#B97D2A"
-RED = "#A44444"
+# Two palettes, one token set. Component CSS never names a colour directly —
+# it references var(--token), so switching themes swaps one small block.
+PALETTES = {
+    "light": {
+        "paper": "#FAF9F6", "card": "#FFFFFF", "sidebar": "#F3F1EB",
+        "subtle": "#FCFBF8", "thead": "#F4F2EC", "chip": "#F6F4EF",
+        "ink": "#1B2437", "ink-hover": "#2A3550", "muted": "#666C78",
+        "faint": "#B9B4A8", "placeholder": "#868D9A",
+        "line": "#E7E4DC", "rule": "#EEEBE3",
+        "green": "#2F6B4F", "amber": "#8F5A15", "red": "#A44444",
+        "cov-bg": "#E9F1EB", "par-bg": "#F6EDDD", "gap-bg": "#F5E7E7",
+        "track": "#E7E4DC",
+        "s1": "#2F6B4F", "s2": "#2456A6", "s3": "#8F5A15", "s4": "#6B4FA8",
+        "s5": "#A44444", "s6": "#3C7D8C", "s7": "#8A6D3B", "s8": "#4F6B2F",
+        "shadow": "0 1px 3px rgba(27,36,55,.05)",
+        "shadow-lift": "0 4px 14px rgba(27,36,55,.09)",
+        "focus": "rgba(36,86,166,.45)", "btn-fg": "#FFFFFF",
+    },
+    "dark": {
+        "paper": "#14161B", "card": "#1C1F26", "sidebar": "#191C22",
+        "subtle": "#1F232A", "thead": "#232830", "chip": "#232830",
+        "ink": "#E8E5DE", "ink-hover": "#F2F0EA", "muted": "#9BA3AF",
+        "faint": "#5A616C", "placeholder": "#727A86",
+        "line": "#2C313A", "rule": "#262A32",
+        "green": "#6BBF8F", "amber": "#E0A44E", "red": "#E58585",
+        "cov-bg": "#1E2C25", "par-bg": "#302819", "gap-bg": "#31201F",
+        "track": "#2C313A",
+        "s1": "#6BBF8F", "s2": "#7EA6E8", "s3": "#E0A44E", "s4": "#B49AE8",
+        "s5": "#E58585", "s6": "#6FB6C6", "s7": "#C7A76A", "s8": "#9CC177",
+        "shadow": "0 1px 3px rgba(0,0,0,.34)",
+        "shadow-lift": "0 4px 16px rgba(0,0,0,.46)",
+        "focus": "rgba(126,166,232,.55)", "btn-fg": "#14161B",
+    },
+}
+
+# Motion tokens — strong curves, short durations (see design notes).
+EASE_OUT = "cubic-bezier(0.23, 1, 0.32, 1)"
+
+
+def theme_css(name):
+    """Emit the palette as CSS custom properties."""
+    p = PALETTES.get(name, PALETTES["light"])
+    body = "".join(f"--{k}:{v};" for k, v in p.items())
+    return f":root{{{body}--ease-out:{EASE_OUT};color-scheme:{name};}}"
+
+
+# Component code refers to these names; they resolve to tokens at render time.
+INK = "var(--ink)"
+INK_HOVER = "var(--ink-hover)"
+PAPER = "var(--paper)"
+CARD = "var(--card)"
+SIDEBAR = "var(--sidebar)"
+SUBTLE = "var(--subtle)"
+THEAD = "var(--thead)"
+CHIP = "var(--chip)"
+LINE = "var(--line)"
+RULE = "var(--rule)"
+MUTED = "var(--muted)"
+FAINT = "var(--faint)"
+PLACEHOLDER = "var(--placeholder)"
+GREEN = "var(--green)"
+AMBER = "var(--amber)"
+RED = "var(--red)"
+SHADOW = "var(--shadow)"
+SHADOW_LIFT = "var(--shadow-lift)"
 
 # Force the light theme at Streamlit's config level so OS/browser dark mode
 # can never produce unreadable widgets, and persist it for future launches.
 try:
     from streamlit import config as _st_config
     _st_config.set_option("theme.base", "light")
-    _st_config.set_option("theme.primaryColor", INK)
-    _st_config.set_option("theme.backgroundColor", PAPER)
-    _st_config.set_option("theme.secondaryBackgroundColor", "#F3F1EB")
-    _st_config.set_option("theme.textColor", INK)
+    _st_config.set_option("theme.primaryColor", PALETTES["light"]["ink"])
+    _st_config.set_option("theme.backgroundColor", PALETTES["light"]["paper"])
+    _st_config.set_option("theme.secondaryBackgroundColor", "{SIDEBAR}")
+    _st_config.set_option("theme.textColor", PALETTES["light"]["ink"])
 except Exception:
     pass
 try:
@@ -57,8 +114,10 @@ try:
         _cfg.parent.mkdir(exist_ok=True)
         _cfg.write_text(
             '[theme]\nbase="light"\nprimaryColor="%s"\n'
-            'backgroundColor="%s"\nsecondaryBackgroundColor="#F3F1EB"\n'
-            'textColor="%s"\n' % (INK, PAPER, INK))
+            'backgroundColor="%s"\nsecondaryBackgroundColor="{SIDEBAR}"\n'
+            'textColor="%s"\n' % (PALETTES['light']['ink'],
+                                    PALETTES['light']['paper'],
+                                    PALETTES['light']['ink']))
 except Exception:
     pass
 
@@ -589,32 +648,84 @@ def limits_for(provider):
             "max_papers": p["max_papers"], "max_out": p["max_out"]}
 
 
+def _api_error(r):
+    """Surface the provider's own error text, which is far more useful than
+    a bare HTTP status."""
+    try:
+        j = r.json()
+        msg = (j.get("error", {}).get("message")
+               if isinstance(j.get("error"), dict) else None) or \
+              j.get("error") or j.get("message") or r.text
+    except Exception:
+        msg = r.text
+    return f"HTTP {r.status_code}: {str(msg)[:300]}"
+
+
 def _one_call(provider, key, system, user, max_out):
+    """One request to one provider.
+
+    Everything runs over plain HTTP so the app needs no vendor SDKs — only
+    `requests`. Gemini still prefers google-genai when it happens to be
+    installed, and falls back to the same REST endpoint otherwise.
+    """
     p = PROVIDERS[provider]
+
     if p["kind"] == "gemini":
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=key)
-        resp = client.models.generate_content(
-            model=p["model"], contents=user,
-            config=types.GenerateContentConfig(
-                system_instruction=system, max_output_tokens=max_out,
-                temperature=0.2))
-        return resp.text or ""
+        try:                                     # use the SDK when present
+            from google import genai
+            from google.genai import types
+            client = genai.Client(api_key=key)
+            resp = client.models.generate_content(
+                model=p["model"], contents=user,
+                config=types.GenerateContentConfig(
+                    system_instruction=system, max_output_tokens=max_out,
+                    temperature=0.2))
+            return resp.text or ""
+        except ImportError:
+            pass                                 # fall through to REST
+        r = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{p['model']}:generateContent",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={"systemInstruction": {"parts": [{"text": system}]},
+                  "contents": [{"role": "user", "parts": [{"text": user}]}],
+                  "generationConfig": {"temperature": 0.2,
+                                       "maxOutputTokens": max_out}},
+            timeout=240)
+        if r.status_code >= 400:
+            raise RuntimeError(_api_error(r))
+        cands = r.json().get("candidates") or []
+        parts = (cands[0].get("content", {}).get("parts", []) if cands else [])
+        return "".join(x.get("text", "") for x in parts)
+
     if p["kind"] == "anthropic":
-        from anthropic import Anthropic
-        client = Anthropic(api_key=key, timeout=180.0)
-        resp = client.messages.create(
-            model=p["model"], max_tokens=max_out, temperature=0.2,
-            system=system, messages=[{"role": "user", "content": user}])
-        return "".join(b.text for b in resp.content if b.type == "text")
-    from openai import OpenAI                      # groq / cerebras / openrouter
-    client = OpenAI(api_key=key, base_url=p["base"], timeout=180.0)
-    r = client.chat.completions.create(
-        model=p["model"], temperature=0.2, max_tokens=max_out,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}])
-    return r.choices[0].message.content or ""
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": p["model"], "max_tokens": max_out,
+                  "temperature": 0.2, "system": system,
+                  "messages": [{"role": "user", "content": user}]},
+            timeout=240)
+        if r.status_code >= 400:
+            raise RuntimeError(_api_error(r))
+        return "".join(b.get("text", "") for b in r.json().get("content", [])
+                       if b.get("type") == "text")
+
+    # OpenAI-compatible: Groq, Cerebras, OpenRouter
+    r = requests.post(
+        f"{p['base']}/chat/completions",
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"},
+        json={"model": p["model"], "temperature": 0.2,
+              "max_tokens": max_out,
+              "messages": [{"role": "system", "content": system},
+                           {"role": "user", "content": user}]},
+        timeout=240)
+    if r.status_code >= 400:
+        raise RuntimeError(_api_error(r))
+    choices = r.json().get("choices") or []
+    return (choices[0].get("message", {}).get("content") or "") if choices else ""
 
 
 def llm_complete(llm, system, user, max_out=None):
@@ -1089,9 +1200,9 @@ REPORT_CSS = f"""
 .report-doc .hm {{ font-family:'IBM Plex Mono',monospace; font-size:.72rem;
   font-weight:600; text-align:center; border-radius:6px; }}
 .report-doc td.hm {{ padding:13px 10px; }}
-.report-doc .hm-cov {{ background:#E9F1EB; color:{GREEN}; }}
-.report-doc .hm-par {{ background:#F6EDDD; color:{AMBER}; }}
-.report-doc .hm-gap {{ background:#F5E7E7; color:{RED}; }}
+.report-doc .hm-cov {{ background:var(--cov-bg); color:{GREEN}; }}
+.report-doc .hm-par {{ background:var(--par-bg); color:{AMBER}; }}
+.report-doc .hm-gap {{ background:var(--gap-bg); color:{RED}; }}
 .report-doc .finding-h {{ display:flex; align-items:center;
   justify-content:space-between; gap:16px; flex-wrap:wrap; }}
 .finding-chip {{ display:inline-flex; align-items:center; gap:8px;
@@ -1105,7 +1216,7 @@ REPORT_CSS = f"""
 
 .verdict {{ background:{CARD}; border:1px solid {LINE}; border-radius:14px;
   padding:22px 26px; margin:4px 0 14px;
-  box-shadow:0 1px 3px rgba(27,36,55,.05); }}
+  box-shadow:{SHADOW}; }}
 .verdict-eyebrow {{ font-family:'IBM Plex Mono',monospace; font-size:.7rem;
   letter-spacing:.14em; text-transform:uppercase; color:{MUTED};
   margin-bottom:2px; }}
@@ -1123,12 +1234,12 @@ REPORT_CSS = f"""
   margin:0 0 8px; }}
 .prisma-card {{ border:1px solid {LINE}; border-radius:12px; padding:15px 22px;
   background:{CARD}; min-width:170px; flex:1;
-  box-shadow:0 1px 3px rgba(27,36,55,.04); }}
+  box-shadow:{SHADOW}; }}
 .prisma-n {{ font-family:'IBM Plex Mono',monospace; font-size:1.6rem;
   font-weight:600; color:{INK}; }}
 .prisma-l {{ font-size:.82rem; font-weight:600; color:{INK}; margin-top:1px; }}
 .prisma-s {{ font-size:.73rem; color:{MUTED}; margin-top:2px; }}
-.prisma-arrow {{ align-self:center; font-size:1.3rem; color:#B9B4A8; }}
+.prisma-arrow {{ align-self:center; font-size:1.3rem; color:{FAINT}; }}
 
 .paper-list {{ display:flex; flex-direction:column; gap:10px; }}
 .paper {{ display:flex; gap:14px; background:{CARD}; border:1px solid {LINE};
@@ -1141,7 +1252,7 @@ REPORT_CSS = f"""
 .paper-meta {{ font-size:.82rem; color:{MUTED}; }}
 .src {{ font-family:'IBM Plex Mono',monospace; font-size:.66rem;
   font-weight:600; padding:1px 8px; border-radius:999px; margin-left:8px;
-  border:1px solid {LINE}; color:{MUTED}; background:#F6F4EF; }}
+  border:1px solid {LINE}; color:{MUTED}; background:{CHIP}; }}
 
 /* Section markers */
 .report-doc h2.sec {{ display:flex; align-items:baseline; gap:14px;
@@ -1152,7 +1263,7 @@ REPORT_CSS = f"""
 
 /* Intro stat strip */
 .stats {{ display:flex; flex-wrap:wrap; border:1px solid {LINE};
-  border-radius:12px; background:#FCFBF8; margin:16px 0 6px; overflow:hidden; }}
+  border-radius:12px; background:{SUBTLE}; margin:16px 0 6px; overflow:hidden; }}
 .stat {{ flex:1; min-width:130px; padding:14px 18px;
   border-left:1px solid {RULE}; }}
 .stat:first-child {{ border-left:none; }}
@@ -1181,7 +1292,7 @@ REPORT_CSS = f"""
 
 /* Open-question cards */
 .oq {{ display:flex; gap:16px; border:1px solid {LINE}; border-radius:12px;
-  background:#FCFBF8; padding:15px 18px; margin:10px 0; }}
+  background:{SUBTLE}; padding:15px 18px; margin:10px 0; }}
 .oq-n {{ font-family:'IBM Plex Mono',monospace; font-weight:600;
   font-size:.78rem; color:{MUTED}; padding-top:2px; }}
 .oq-q {{ font-weight:600; color:{INK}; }}
@@ -1218,8 +1329,10 @@ REPORT_CSS = f"""
 
 
 def build_html_export(title, question, hero_html, report_html, counts,
+                      theme="light",
                       brand="Deep Search Report &middot; ERIC &middot; OpenAlex &middot; Semantic Scholar &middot; CrossRef", subtitle=None):
     t, q = html_lib.escape(title), html_lib.escape(question)
+    light_vars = "".join(f"--{k}:{v};" for k, v in PALETTES["light"].items())
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1228,12 +1341,13 @@ def build_html_export(title, question, hero_html, report_html, counts,
 <title>{t}</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
+  {theme_css(theme)}
   * {{ box-sizing:border-box; }}
   body {{ font-family:'Public Sans',system-ui,sans-serif; color:{INK};
          background:{PAPER}; margin:0; }}
   .wrap {{ max-width:840px; margin:0 auto; padding:48px 24px; }}
   .sheet {{ background:{CARD}; border:1px solid {LINE}; border-radius:14px;
-            padding:56px 60px; box-shadow:0 1px 3px rgba(27,36,55,.05); }}
+            padding:56px 60px; box-shadow:{SHADOW}; }}
   .brand {{ font-family:'IBM Plex Mono',monospace; font-size:.7rem;
             letter-spacing:.15em; text-transform:uppercase; color:{MUTED};
             margin-bottom:18px; }}
@@ -1250,6 +1364,7 @@ def build_html_export(title, question, hero_html, report_html, counts,
     .prisma-arrow {{ display:none; }}
   }}
   @media print {{
+    :root {{ {light_vars} }}
     body {{ background:#fff; font-size:12.5px; }}
     .wrap {{ max-width:100%; padding:0; }}
     .sheet {{ border:none; box-shadow:none; padding:0; border-radius:0; }}
@@ -1277,8 +1392,11 @@ Every figure and citation is grounded in the retrieved records shown above.</div
 # App shell CSS — explicit light styling so dark browser themes can't break it
 # ==========================================================================
 
-APP_CSS = f"""
+def app_css(theme):
+    THEME_VARS = theme_css(theme)
+    return f"""
 <style>
+{THEME_VARS}
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
 
 .stApp, [data-testid="stAppViewContainer"] {{ background:{PAPER}; }}
@@ -1307,9 +1425,9 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2 {{
 .app-sub {{ color:{MUTED}; font-size:.95rem; margin:.5rem 0 0; }}
 
 /* Sidebar */
-[data-testid="stSidebar"] {{ background:#F3F1EB; border-right:1px solid {LINE}; }}
+[data-testid="stSidebar"] {{ background:{SIDEBAR}; border-right:1px solid {LINE}; }}
 [data-testid="stSidebar"] * {{ color:{INK}; }}
-[data-testid="stSidebar"] .stMarkdown p {{ font-size:.86rem; color:#565D6B; }}
+[data-testid="stSidebar"] .stMarkdown p {{ font-size:.86rem; color:{MUTED}; }}
 [data-testid="stSidebar"] a {{ color:{GREEN} !important; }}
 
 /* Inputs — forced light so they're readable in any browser theme */
@@ -1319,7 +1437,7 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2 {{
   caret-color:{INK};
 }}
 .stTextArea textarea::placeholder, .stTextInput input::placeholder {{
-  color:#9AA0AB !important; opacity:1;
+  color:{PLACEHOLDER} !important; opacity:1;
 }}
 .stTextArea [data-baseweb="textarea"], .stTextInput [data-baseweb="input"],
 .stTextArea [data-baseweb="base-input"], .stTextInput [data-baseweb="base-input"] {{
@@ -1343,15 +1461,15 @@ button[data-testid^="stBaseButton"] p {{ color:{INK} !important; }}
 .stFormSubmitButton button:active {{ transform:scale(0.98); }}
 .stButton button[kind="primary"], .stFormSubmitButton button[kind="primary"],
 button[data-testid="stBaseButton-primary"] {{
-  background:{INK} !important; color:#FFFFFF !important;
+  background:{INK} !important; color:var(--btn-fg) !important;
   border:1px solid {INK} !important;
 }}
 .stButton button[kind="primary"]:hover,
 button[data-testid="stBaseButton-primary"]:hover {{
-  background:#2A3550 !important; border-color:#2A3550 !important;
+  background:{INK_HOVER} !important; border-color:{INK_HOVER} !important;
 }}
 .stButton button[kind="primary"] p, .stFormSubmitButton button[kind="primary"] p,
-button[data-testid="stBaseButton-primary"] p {{ color:#FFFFFF !important; }}
+button[data-testid="stBaseButton-primary"] p {{ color:var(--btn-fg) !important; }}
 @media (prefers-reduced-motion: reduce) {{
   .stButton > button, .stDownloadButton > button,
   .stFormSubmitButton > button {{ transition:none; }}
@@ -1372,7 +1490,7 @@ button[data-testid="stBaseButton-primary"] p {{ color:#FFFFFF !important; }}
 .how-row {{ display:flex; gap:14px; flex-wrap:wrap; margin-top:6px; }}
 .how-card {{ flex:1; min-width:200px; background:{CARD}; border:1px solid {LINE};
   border-radius:12px; padding:18px 20px;
-  box-shadow:0 1px 3px rgba(27,36,55,.04); }}
+  box-shadow:{SHADOW}; }}
 .how-step {{ font-family:'IBM Plex Mono',monospace; font-size:.68rem;
   letter-spacing:.12em; text-transform:uppercase; color:{MUTED}; }}
 .how-title {{ font-weight:600; margin:6px 0 4px; color:{INK}; }}
@@ -1383,6 +1501,86 @@ button[data-testid="stBaseButton-primary"] p {{ color:#FFFFFF !important; }}
 .result-title {{ font-family:'Fraunces',Georgia,serif; font-weight:600;
   font-size:1.55rem; line-height:1.3; letter-spacing:-.01em; color:{INK}; }}
 .result-meta {{ font-size:.85rem; color:{MUTED}; margin-top:6px; }}
+
+/* ---- Focus visibility (was missing entirely) ------------------------- */
+*:focus-visible {{
+  outline:2px solid var(--focus) !important; outline-offset:2px;
+  border-radius:8px;
+}}
+.stButton button:focus:not(:focus-visible) {{ outline:none; }}
+
+/* ---- Motion: short, strong curves, gated on reduced-motion ----------- */
+.stButton button, .stDownloadButton button, .stFormSubmitButton button,
+button[data-testid^="stBaseButton"] {{
+  transition:transform 140ms var(--ease-out), background-color 160ms ease,
+             border-color 160ms ease, box-shadow 160ms ease;
+}}
+@media (hover:hover) and (pointer:fine) {{
+  .stButton button:hover, .stDownloadButton button:hover {{
+    box-shadow:{SHADOW_LIFT}; transform:translateY(-1px);
+  }}
+  .how-card:hover, .paper:hover {{
+    border-color:{MUTED}; box-shadow:{SHADOW_LIFT};
+  }}
+}}
+.how-card, .paper {{
+  transition:border-color 160ms ease, box-shadow 160ms ease;
+}}
+
+/* ---- Entrance: brief stagger on the empty-state cards ---------------- */
+.how-card {{ opacity:0; animation:riseIn 260ms var(--ease-out) forwards; }}
+.how-card:nth-child(2) {{ animation-delay:60ms; }}
+.how-card:nth-child(3) {{ animation-delay:120ms; }}
+@keyframes riseIn {{ from {{ opacity:0; transform:translateY(6px); }}
+                     to {{ opacity:1; transform:none; }} }}
+
+@media (prefers-reduced-motion: reduce) {{
+  *, *::before, *::after {{
+    animation-duration:.01ms !important; animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+  }}
+  .how-card {{ opacity:1; }}
+}}
+
+/* ---- Mode switch styled as a segmented control ----------------------- */
+div[data-testid="stRadio"] > div[role="radiogroup"] {{
+  gap:4px; background:{SUBTLE}; border:1px solid {LINE};
+  border-radius:11px; padding:4px; display:inline-flex;
+}}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label {{
+  margin:0; padding:7px 16px; border-radius:8px; cursor:pointer;
+  transition:background-color 160ms ease, color 160ms ease;
+}}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked) {{
+  background:{CARD}; box-shadow:{SHADOW};
+}}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:first-child {{
+  display:none;                     /* hide the dot, keep the pill */
+}}
+div[data-testid="stRadio"] label p {{
+  font-weight:600; font-size:.9rem; color:{MUTED}; }}
+div[data-testid="stRadio"] label:has(input:checked) p {{ color:{INK}; }}
+[data-testid="stSidebar"] div[role="radiogroup"] {{ display:flex; width:100%; }}
+[data-testid="stSidebar"] div[role="radiogroup"] > label {{ flex:1;
+  text-align:center; justify-content:center; }}
+
+/* ---- Dropdown popovers (render outside the app tree) ----------------- */
+[data-baseweb="popover"] div, [role="listbox"] {{
+  background:{CARD} !important; border-color:{LINE} !important;
+}}
+[role="option"] {{ background:{CARD} !important; color:{INK} !important; }}
+[role="option"]:hover {{ background:{SUBTLE} !important; }}
+
+/* ---- Misc surfaces that Streamlit paints itself ---------------------- */
+[data-testid="stStatusWidget"], [data-testid="stNotification"],
+[data-testid="stAlert"] {{ background:{CARD}; border:1px solid {LINE};
+  border-radius:12px; color:{INK}; }}
+[data-testid="stAlert"] p {{ color:{INK}; }}
+hr, [data-testid="stDivider"] {{ border-color:{LINE}; }}
+code, pre {{ background:{SUBTLE} !important; color:{INK} !important;
+  border:1px solid {LINE}; border-radius:6px; }}
+::placeholder {{ color:{PLACEHOLDER} !important; }}
+[data-testid="stSlider"] [role="slider"] {{ border-color:{INK}; }}
 
 {REPORT_CSS}
 </style>
@@ -1608,8 +1806,7 @@ def load_dataset(entry, opts):
 
 # ---- Deterministic data visuals -----------------------------------------
 
-SERIES_COLORS = [GREEN, "#2456A6", AMBER, "#6B4FA8", RED, "#3C7D8C",
-                 "#8A6D3B", "#4F6B2F"]
+SERIES_COLORS = [f"var(--s{i})" for i in range(1, 9)]
 
 
 def _fmt(v, unit=""):
@@ -1845,7 +2042,9 @@ def pick_indicator(llm, question):
 
 st.set_page_config(page_title="Education Research Assistant",
                    page_icon="📖", layout="wide")
-st.markdown(APP_CSS, unsafe_allow_html=True)
+if "theme" not in st.session_state:
+    st.session_state.theme = "light"
+st.markdown(app_css(st.session_state.theme), unsafe_allow_html=True)
 
 LIT_EXAMPLES = [
     "Does retrieval practice improve K-12 science learning?",
@@ -1869,6 +2068,20 @@ def _set_data(text):
 
 # ---- Sidebar: model provider + keys --------------------------------------
 with st.sidebar:
+    st.markdown("#### Appearance")
+
+    def _flip_theme():
+        st.session_state.theme = (
+            "dark" if st.session_state.theme == "light" else "light")
+
+    _dark = st.session_state.theme == "dark"
+    st.button("Switch to dark" if not _dark else "Switch to light",
+              on_click=_flip_theme, use_container_width=True,
+              key="theme_toggle",
+              help="Applies to the app and to reports you download. "
+                   "Printing always uses the light theme.")
+
+    st.divider()
     st.markdown("#### Model")
     _labels = {k: f"{PROVIDERS[k]['label']} · {PROVIDERS[k]['cost']}"
                for k in PROVIDER_ORDER}
@@ -2063,7 +2276,8 @@ if app_mode.endswith("Literature review"):
                 if r.get("mode") == "landscape" and r.get("findings")
                 else verdict_html(meter))
         html_out = build_html_export(r["title"], r["question"], hero,
-                                     report_html, counts)
+                                     report_html, counts,
+                                     theme=st.session_state.theme)
         dl1, dl2, _sp = st.columns([1, 1, 1])
         with dl1:
             st.download_button("Download report (HTML)", html_out,
@@ -2360,6 +2574,7 @@ else:
                f'{date.today().strftime("%B %d, %Y")}')
         html_out = build_html_export(
             dr["title"], dr["question"], visuals, body_html, {},
+            theme=st.session_state.theme,
             brand=f'Data Analysis &middot; {html_lib.escape(ds["entry"]["src"])}',
             subtitle=sub)
         e1, e2, _e3 = st.columns([1, 1, 1])
