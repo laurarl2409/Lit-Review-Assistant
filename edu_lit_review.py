@@ -76,9 +76,45 @@ TIMEOUT = 20
 HEADERS = {"User-Agent": "EduLitReview/1.0 (mailto:researcher@example.org)"}
 
 
+STOPWORDS = {
+    "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
+    "does", "do", "did", "is", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "can", "could", "should", "would", "will", "shall",
+    "may", "might", "must",
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by",
+    "from", "about", "into", "over", "under", "between", "among", "during",
+    "and", "or", "but", "if", "then", "than", "that", "this", "these",
+    "those", "there", "their", "them", "they", "it", "its", "as", "any",
+    "some", "such", "more", "most", "much", "many", "also", "other",
+    "evidence", "research", "literature", "study", "studies", "paper",
+    "papers", "article", "articles", "review", "reviews", "finding",
+    "findings", "data", "show", "shows", "shown", "exist", "exists",
+}
+
+
+def search_terms(q, max_terms=10):
+    """Turn a natural-language question into a keyword query.
+
+    Academic APIs are built for keywords: a sentence-length `search` value
+    makes OpenAlex time out (504) and makes Semantic Scholar return nothing.
+    Content words only, original order, capped length.
+    """
+    cleaned = re.sub(r"[^\w\s-]", " ", q)
+    words, seen = [], set()
+    for w in cleaned.split():
+        key = w.lower().strip("-")
+        if not key or len(key) < 2 or key in seen or key in STOPWORDS:
+            continue
+        seen.add(key)
+        words.append(w)
+        if len(words) >= max_terms:
+            break
+    return " ".join(words) if words else re.sub(r"\s+", " ", cleaned).strip()
+
+
 def clean_query(q):
-    """Strip punctuation that some APIs reject in search strings."""
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s-]", " ", q)).strip()
+    """Search string used for every literature API."""
+    return search_terms(q)
 
 
 def fetch_eric(query):
@@ -131,14 +167,23 @@ def fetch_openalex(query):
         "mailto": "researcher@example.org",
     }
     try:
-        r = requests.get(
-            "https://api.openalex.org/works",
-            params={**base_params, "filter": "primary_topic.subfield.id:3304"},
-            headers=HEADERS, timeout=TIMEOUT,
-        )
-        if r.status_code >= 400:          # filter rejected — retry unfiltered
-            r = requests.get("https://api.openalex.org/works",
-                             params=base_params, headers=HEADERS, timeout=TIMEOUT)
+        r = None
+        # Filtered first, then unfiltered; retry 5xx with backoff because
+        # OpenAlex intermittently times out under load.
+        for params in ({**base_params,
+                        "filter": "primary_topic.subfield.id:3304"},
+                       base_params):
+            for attempt in range(3):
+                r = requests.get("https://api.openalex.org/works",
+                                 params=params, headers=HEADERS, timeout=45)
+                if r.status_code < 400:
+                    break
+                if r.status_code >= 500:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                break
+            if r is not None and r.status_code < 400:
+                break
         r.raise_for_status()
         for w in r.json().get("results", []):
             title = w.get("display_name") or ""
@@ -481,78 +526,131 @@ def question_mode(q):
         return "landscape"
     return "consensus"
 
-GEMINI_MODEL = "gemini-3.5-flash"          # free tier via Google AI Studio
-GITHUB_MODEL = "openai/gpt-4.1"            # free tier via GitHub Models (PAT)
-GITHUB_ENDPOINTS = ("https://models.github.ai/inference",
-                    "https://models.inference.ai.azure.com")
-
-# GitHub Models' free tier caps each request at 8k input / 4k output tokens,
-# so the evidence context is trimmed hard for that provider. Gemini's free
-# tier is far roomier and gets the full corpus.
-PROVIDER_LIMITS = {
-    "gemini": {"abstract_chars": 1400, "max_papers": 25, "max_out": 16000},
-    "github": {"abstract_chars": 520, "max_papers": 12, "max_out": 4000},
+# --- Model providers ------------------------------------------------------
+# Free tiers first. Every provider except Gemini and Anthropic speaks the
+# OpenAI chat-completions API, so one code path covers Groq, Cerebras, and
+# OpenRouter.
+PROVIDERS = {
+    "gemini": {
+        "label": "Google Gemini 3.5 Flash", "cost": "Free",
+        "kind": "gemini", "model": "gemini-3.5-flash",
+        "key_label": "Gemini API key", "env": "GEMINI_API_KEY",
+        "url": "https://aistudio.google.com/apikey",
+        "note": "~15 requests/min, 1,500/day. Best free quality.",
+        "abstract_chars": 1400, "max_papers": 25, "max_out": 16000},
+    "groq": {
+        "label": "Groq — Llama 3.3 70B", "cost": "Free",
+        "kind": "openai", "model": "llama-3.3-70b-versatile",
+        "base": "https://api.groq.com/openai/v1",
+        "key_label": "Groq API key", "env": "GROQ_API_KEY",
+        "url": "https://console.groq.com/keys",
+        "note": "~30 requests/min, no card required. Very fast.",
+        "abstract_chars": 900, "max_papers": 18, "max_out": 8000},
+    "cerebras": {
+        "label": "Cerebras — GPT-OSS 120B", "cost": "Free",
+        "kind": "openai", "model": "gpt-oss-120b",
+        "base": "https://api.cerebras.ai/v1",
+        "key_label": "Cerebras API key", "env": "CEREBRAS_API_KEY",
+        "url": "https://cloud.cerebras.ai",
+        "note": "~1M tokens/day. Fastest throughput of the free tiers.",
+        "abstract_chars": 900, "max_papers": 18, "max_out": 8000},
+    "openrouter": {
+        "label": "OpenRouter — free models", "cost": "Free",
+        "kind": "openai", "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "base": "https://openrouter.ai/api/v1",
+        "key_label": "OpenRouter API key", "env": "OPENROUTER_API_KEY",
+        "url": "https://openrouter.ai/keys",
+        "note": "One key, dozens of free models. ~20 requests/min.",
+        "abstract_chars": 900, "max_papers": 18, "max_out": 8000},
+    "anthropic": {
+        "label": "Claude Haiku 4.5", "cost": "Paid — about $0.03 per report",
+        "kind": "anthropic", "model": "claude-haiku-4-5",
+        "key_label": "Anthropic API key", "env": "ANTHROPIC_API_KEY",
+        "url": "https://console.anthropic.com/settings/keys",
+        "note": "$1/$5 per million tokens. Reliable when free tiers are busy.",
+        "abstract_chars": 1400, "max_papers": 25, "max_out": 8000},
 }
+PROVIDER_ORDER = ["gemini", "groq", "cerebras", "openrouter", "anthropic"]
+
+# Errors worth retrying or failing over on: overload, rate limit, transient 5xx.
+TRANSIENT = ("429", "500", "502", "503", "504", "resource_exhausted",
+             "unavailable", "overloaded", "rate limit", "rate_limit",
+             "quota", "high demand", "timeout", "timed out", "capacity")
+
+
+def _is_transient(e):
+    s = str(e).lower()
+    return any(t in s for t in TRANSIENT)
+
+
+def limits_for(provider):
+    p = PROVIDERS[provider]
+    return {"abstract_chars": p["abstract_chars"],
+            "max_papers": p["max_papers"], "max_out": p["max_out"]}
+
+
+def _one_call(provider, key, system, user, max_out):
+    p = PROVIDERS[provider]
+    if p["kind"] == "gemini":
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=key)
+        resp = client.models.generate_content(
+            model=p["model"], contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system, max_output_tokens=max_out,
+                temperature=0.2))
+        return resp.text or ""
+    if p["kind"] == "anthropic":
+        from anthropic import Anthropic
+        client = Anthropic(api_key=key, timeout=180.0)
+        resp = client.messages.create(
+            model=p["model"], max_tokens=max_out, temperature=0.2,
+            system=system, messages=[{"role": "user", "content": user}])
+        return "".join(b.text for b in resp.content if b.type == "text")
+    from openai import OpenAI                      # groq / cerebras / openrouter
+    client = OpenAI(api_key=key, base_url=p["base"], timeout=180.0)
+    r = client.chat.completions.create(
+        model=p["model"], temperature=0.2, max_tokens=max_out,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}])
+    return r.choices[0].message.content or ""
 
 
 def llm_complete(llm, system, user, max_out=None):
-    """One call, either provider. `llm` is {"provider": ..., "key": ...}."""
-    provider = llm.get("provider", "gemini")
-    key = (llm.get("key") or "").strip()
-    lim = PROVIDER_LIMITS[provider]
-    max_out = max_out or lim["max_out"]
-    if not key:
-        raise RuntimeError("No API key provided for the selected model.")
+    """Call the primary provider; on transient failure retry, then fail over
+    to the backup provider if one is configured.
 
-    last_err = None
-    for attempt in range(3):
-        try:
-            if provider == "gemini":
-                from google import genai
-                from google.genai import types
-                client = genai.Client(api_key=key)
-                resp = client.models.generate_content(
-                    model=GEMINI_MODEL, contents=user,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system, max_output_tokens=max_out,
-                        temperature=0.2))
-                text = resp.text or ""
-            else:
-                from openai import OpenAI
-                text, sub_err = "", None
-                for base in GITHUB_ENDPOINTS:
-                    model = (GITHUB_MODEL if "github.ai" in base
-                             else GITHUB_MODEL.split("/")[-1])
-                    try:
-                        client = OpenAI(api_key=key, base_url=base, timeout=180)
-                        r = client.chat.completions.create(
-                            model=model, temperature=0.2, max_tokens=max_out,
-                            messages=[{"role": "system", "content": system},
-                                      {"role": "user", "content": user}])
-                        text = (r.choices[0].message.content or "")
-                        sub_err = None
-                        break
-                    except Exception as e2:
-                        sub_err = e2
-                        if any(t in str(e2).lower() for t in
-                               ("rate limit", "429", "quota")):
-                            raise
-                if sub_err:
-                    raise sub_err
-            if not text.strip():
-                raise RuntimeError(
-                    "The model returned an empty response. This usually means "
-                    "the request was rate-limited or filtered — wait a minute "
-                    "and try again.")
-            return text
-        except Exception as e:
-            last_err = e
-            if any(t in str(e).lower() for t in
-                   ("429", "resource_exhausted", "rate limit", "quota")):
-                time.sleep(15 * (attempt + 1))
-            else:
-                raise
-    raise last_err
+    `llm` is {"provider":..., "key":..., "backup":..., "backup_key":...}
+    """
+    chain = [(llm.get("provider", "gemini"), (llm.get("key") or "").strip())]
+    if llm.get("backup"):
+        chain.append((llm["backup"], (llm.get("backup_key") or "").strip()))
+    chain = [(p, k) for p, k in chain if k]      # skip providers without a key
+    if not chain:
+        raise RuntimeError("No API key provided. Add one in the sidebar.")
+
+    errors = {}          # one message per provider, so both get named
+    for idx, (provider, key) in enumerate(chain):
+        cap = max_out or PROVIDERS[provider]["max_out"]
+        cap = min(cap, PROVIDERS[provider]["max_out"])
+        for attempt in range(3):
+            try:
+                text = _one_call(provider, key, system, user, cap)
+                if not text.strip():
+                    raise RuntimeError("empty response")
+                if idx > 0:
+                    st.info(f"{PROVIDERS[chain[0][0]]['label']} was "
+                            f"unavailable — this was generated with "
+                            f"{PROVIDERS[provider]['label']} instead.")
+                return text
+            except Exception as e:
+                errors[provider] = f"{PROVIDERS[provider]['label']}: {e}"
+                if not _is_transient(e):
+                    break                       # bad key / bad request
+                if attempt < 2:
+                    time.sleep(6 * (attempt + 1))
+    raise RuntimeError(" | ".join(errors.values()))
 
 
 def synthesize(llm, question, context, counts, mode="consensus"):
@@ -652,7 +750,7 @@ def synthesize_followup(llm, question, report_title, context, start_n):
         f"Close with one sentence connecting this to the original report's "
         f"conclusion. Do not add a References section.")
     return llm_complete(llm, SYSTEM_PROMPT, user_msg,
-                        max_out=min(8000, PROVIDER_LIMITS[llm["provider"]]["max_out"]))
+                        max_out=min(8000, PROVIDERS[llm["provider"]]["max_out"]))
 
 
 # ==========================================================================
@@ -1694,7 +1792,7 @@ claims.
 
 def analyze_data(llm, question, ds):
     rows = sorted(ds["rows"], key=lambda r: (r["entity"], r["year"]))
-    lim = PROVIDER_LIMITS[llm["provider"]]
+    lim = limits_for(llm["provider"])
     budget = 120 if lim["max_out"] <= 4000 else 400
     if len(rows) > budget:                 # keep every entity's endpoints
         by_ent = {}
@@ -1772,33 +1870,37 @@ def _set_data(text):
 # ---- Sidebar: model provider + keys --------------------------------------
 with st.sidebar:
     st.markdown("#### Model")
-    provider_label = st.radio(
-        "Model provider", ["Google Gemini (free)", "GitHub Models (GPT-4.1)"],
-        label_visibility="collapsed",
-        help="Gemini's free tier allows much larger requests. GitHub Models "
-             "gives you GPT-4.1 but caps free requests at 8k in / 4k out, so "
-             "reports are built from a trimmed evidence set.")
-    provider = "gemini" if provider_label.startswith("Google") else "github"
+    _labels = {k: f"{PROVIDERS[k]['label']} · {PROVIDERS[k]['cost']}"
+               for k in PROVIDER_ORDER}
+    provider = st.selectbox(
+        "Model provider", PROVIDER_ORDER, index=0,
+        format_func=lambda k: _labels[k], label_visibility="collapsed")
+    _p = PROVIDERS[provider]
+    api_key = st.text_input(_p["key_label"], type="password",
+                            value=os.environ.get(_p["env"], ""))
+    st.caption(_p["note"])
+    st.markdown(f"[Get a key]({_p['url']})")
 
-    if provider == "gemini":
-        api_key = st.text_input(
-            "Gemini API key", type="password",
-            value=os.environ.get("GEMINI_API_KEY", ""),
-            help="Free key from Google AI Studio — no billing required.")
-        st.markdown("[Get a free key at aistudio.google.com/apikey]"
-                    "(https://aistudio.google.com/apikey)")
-    else:
-        api_key = st.text_input(
-            "GitHub personal access token", type="password",
-            value=os.environ.get("GITHUB_TOKEN", ""),
-            help="A PAT with the models:read permission. Free tier is rate "
-                 "limited to roughly 150 requests/day.")
-        st.markdown("[Create a token with models:read]"
-                    "(https://github.com/settings/personal-access-tokens)")
-        st.caption("Free GitHub Models requests cap at 8k input tokens, so "
-                   "literature reports use up to 12 papers instead of 25.")
+    with st.expander("Backup model (recommended)", expanded=False):
+        st.caption("Free tiers get busy. If the primary is overloaded or rate "
+                   "limited, the app retries and then automatically uses this "
+                   "backup instead — you don't have to do anything.")
+        _b_opts = ["None"] + [k for k in PROVIDER_ORDER if k != provider]
+        backup = st.selectbox(
+            "Backup provider", _b_opts,
+            format_func=lambda k: "None" if k == "None" else _labels[k])
+        backup_key = ""
+        if backup != "None":
+            _bp = PROVIDERS[backup]
+            backup_key = st.text_input(_bp["key_label"], type="password",
+                                       value=os.environ.get(_bp["env"], ""),
+                                       key="backup_key_input")
+            st.caption(_bp["note"])
+            st.markdown(f"[Get a key]({_bp['url']})")
 
-    llm = {"provider": provider, "key": api_key}
+    llm = {"provider": provider, "key": api_key,
+           "backup": None if backup == "None" else backup,
+           "backup_key": backup_key}
 
     st.divider()
     st.markdown("#### Optional keys")
@@ -1866,7 +1968,7 @@ if app_mode.endswith("Literature review"):
             st.stop()
 
         q = question.strip()
-        lim = PROVIDER_LIMITS[provider]
+        lim = limits_for(provider)
         with st.status("Running deep search…", expanded=True) as status:
             st.write("Searching ERIC…")
             eric = fetch_eric(q)
@@ -1893,8 +1995,8 @@ if app_mode.endswith("Literature review"):
                 st.stop()
 
             mode = question_mode(q)
-            st.write(f"{counts['included']} papers included. Synthesizing with "
-                     f"{'Gemini' if provider == 'gemini' else 'GPT-4.1'} "
+            st.write(f"{counts['included']} papers included. Synthesizing "
+                     f"with {PROVIDERS[provider]['label']} "
                      f"({'findings landscape' if mode == 'landscape' else 'consensus'} "
                      f"report)…")
             try:
@@ -2063,7 +2165,7 @@ if app_mode.endswith("Literature review"):
             if not api_key:
                 st.error("Add your API key in the sidebar to run follow-ups.")
             else:
-                lim = PROVIDER_LIMITS[provider]
+                lim = limits_for(provider)
                 with st.status(f"Following up: {fu_q[:60]}…", expanded=True) as fst:
                     st.write("Searching ERIC…")
                     f_eric = fetch_eric(fu_q)
@@ -2194,8 +2296,8 @@ else:
                          "different dataset.")
                 st.stop()
 
-            st.write(f"{len(ds['rows'])} observations retrieved. Analyzing with "
-                     f"{'Gemini' if provider == 'gemini' else 'GPT-4.1'}…")
+            st.write(f"{len(ds['rows'])} observations retrieved. Analyzing "
+                     f"with {PROVIDERS[provider]['label']}…")
             try:
                 raw = clean_llm_output(analyze_data(llm, q, ds))
             except Exception as e:
