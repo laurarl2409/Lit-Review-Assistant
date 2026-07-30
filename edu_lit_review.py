@@ -216,6 +216,68 @@ def fetch_semantic_scholar(query, s2_key=""):
     return papers
 
 
+def _strip_jats(s):
+    """CrossRef abstracts arrive as JATS XML; reduce to plain text."""
+    s = re.sub(r"<jats:title>.*?</jats:title>", " ", s, flags=re.S | re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html_lib.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+CROSSREF_TYPES = {"journal-article", "proceedings-article", "book-chapter",
+                  "posted-content", "report", "monograph", "reference-entry"}
+
+
+def fetch_crossref(query):
+    papers = []
+    try:
+        r = requests.get(
+            "https://api.crossref.org/works",
+            params={
+                "query": clean_query(query), "rows": 15,
+                "select": ("title,author,issued,container-title,abstract,"
+                           "is-referenced-by-count,DOI,URL,type"),
+                "mailto": "researcher@example.org",
+            },
+            headers=HEADERS, timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        for w in (r.json().get("message", {}) or {}).get("items", []) or []:
+            if w.get("type") and w["type"] not in CROSSREF_TYPES:
+                continue
+            titles = w.get("title") or []
+            title = (titles[0] if titles else "").strip()
+            if not title:
+                continue
+            authors = []
+            for a in (w.get("author") or []):
+                nm = " ".join(x for x in (a.get("given"), a.get("family")) if x)
+                if not nm:
+                    nm = a.get("name") or ""
+                if nm:
+                    authors.append(nm)
+            year = None
+            parts = ((w.get("issued") or {}).get("date-parts") or [[]])[0]
+            if parts and isinstance(parts[0], int):
+                year = parts[0]
+            venues = w.get("container-title") or []
+            doi = w.get("DOI")
+            papers.append({
+                "title": title,
+                "authors": authors,
+                "year": year,
+                "venue": (venues[0] if venues else "CrossRef"),
+                "abstract": _strip_jats(w.get("abstract") or ""),
+                "citations": w.get("is-referenced-by-count"),
+                "doi": doi,
+                "url": w.get("URL") or (f"https://doi.org/{doi}" if doi else ""),
+                "source": "CrossRef",
+            })
+    except Exception as e:
+        st.warning(f"CrossRef didn't respond ({e}). Continuing with the other sources.")
+    return papers
+
+
 # ==========================================================================
 # Screening (PRISMA), grounding context, BibTeX, references
 # ==========================================================================
@@ -235,7 +297,7 @@ def dedupe_and_screen(all_papers, max_included=25, prior_keys=None):
     return screened, with_text[:max_included]
 
 
-def build_context(included, start=1):
+def build_context(included, start=1, abstract_chars=1400):
     blocks = []
     for i, p in enumerate(included, start):
         authors = ", ".join(p["authors"][:5]) or "Unknown authors"
@@ -245,7 +307,7 @@ def build_context(included, start=1):
             f"Venue: {p['venue']} | Citations: "
             f"{p['citations'] if p['citations'] is not None else 'n/a'} | "
             f"Source DB: {p['source']}\n"
-            f"    Abstract: {p['abstract'][:1400]}"
+            f"    Abstract: {p['abstract'][:abstract_chars]}"
         )
     return "\n\n".join(blocks)
 
@@ -419,44 +481,92 @@ def question_mode(q):
         return "landscape"
     return "consensus"
 
-GEMINI_MODEL = "gemini-3.5-flash"  # has a free tier as of mid-2026
+GEMINI_MODEL = "gemini-3.5-flash"          # free tier via Google AI Studio
+GITHUB_MODEL = "openai/gpt-4.1"            # free tier via GitHub Models (PAT)
+GITHUB_ENDPOINTS = ("https://models.github.ai/inference",
+                    "https://models.inference.ai.azure.com")
+
+# GitHub Models' free tier caps each request at 8k input / 4k output tokens,
+# so the evidence context is trimmed hard for that provider. Gemini's free
+# tier is far roomier and gets the full corpus.
+PROVIDER_LIMITS = {
+    "gemini": {"abstract_chars": 1400, "max_papers": 25, "max_out": 16000},
+    "github": {"abstract_chars": 520, "max_papers": 12, "max_out": 4000},
+}
 
 
-def synthesize(api_key, question, context, counts, mode="consensus"):
-    from google import genai
-    from google.genai import types
-    client = genai.Client(api_key=api_key)
-    user_msg = (
-        f"RESEARCH QUESTION: {question}\n\n"
-        f"PRISMA COUNTS — Retrieved: {counts['retrieved']} "
-        f"(ERIC {counts['eric']}, OpenAlex {counts['openalex']}, "
-        f"Semantic Scholar {counts['s2']}); Screened after dedup: "
-        f"{counts['screened']}; Included with usable abstracts: {counts['included']}.\n\n"
-        f"INCLUDED PAPERS (your ONLY evidence base):\n\n{context}\n\n"
-        + (LANDSCAPE_INSTRUCTIONS if mode == "landscape" else CONSENSUS_INSTRUCTIONS)
-    )
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT, max_output_tokens=16000,
-        temperature=0.2)   # low temperature keeps formatting identical across runs
+def llm_complete(llm, system, user, max_out=None):
+    """One call, either provider. `llm` is {"provider": ..., "key": ...}."""
+    provider = llm.get("provider", "gemini")
+    key = (llm.get("key") or "").strip()
+    lim = PROVIDER_LIMITS[provider]
+    max_out = max_out or lim["max_out"]
+    if not key:
+        raise RuntimeError("No API key provided for the selected model.")
+
     last_err = None
     for attempt in range(3):
         try:
-            resp = client.models.generate_content(
-                model=GEMINI_MODEL, contents=user_msg, config=config)
-            text = resp.text or ""
+            if provider == "gemini":
+                from google import genai
+                from google.genai import types
+                client = genai.Client(api_key=key)
+                resp = client.models.generate_content(
+                    model=GEMINI_MODEL, contents=user,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system, max_output_tokens=max_out,
+                        temperature=0.2))
+                text = resp.text or ""
+            else:
+                from openai import OpenAI
+                text, sub_err = "", None
+                for base in GITHUB_ENDPOINTS:
+                    model = (GITHUB_MODEL if "github.ai" in base
+                             else GITHUB_MODEL.split("/")[-1])
+                    try:
+                        client = OpenAI(api_key=key, base_url=base, timeout=180)
+                        r = client.chat.completions.create(
+                            model=model, temperature=0.2, max_tokens=max_out,
+                            messages=[{"role": "system", "content": system},
+                                      {"role": "user", "content": user}])
+                        text = (r.choices[0].message.content or "")
+                        sub_err = None
+                        break
+                    except Exception as e2:
+                        sub_err = e2
+                        if any(t in str(e2).lower() for t in
+                               ("rate limit", "429", "quota")):
+                            raise
+                if sub_err:
+                    raise sub_err
             if not text.strip():
                 raise RuntimeError(
-                    "Gemini returned an empty response. This usually means the "
-                    "request was rate-limited or filtered — wait a minute and "
-                    "run the search again.")
+                    "The model returned an empty response. This usually means "
+                    "the request was rate-limited or filtered — wait a minute "
+                    "and try again.")
             return text
         except Exception as e:
             last_err = e
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            if any(t in str(e).lower() for t in
+                   ("429", "resource_exhausted", "rate limit", "quota")):
                 time.sleep(15 * (attempt + 1))
             else:
                 raise
     raise last_err
+
+
+def synthesize(llm, question, context, counts, mode="consensus"):
+    user_msg = (
+        f"RESEARCH QUESTION: {question}\n\n"
+        f"PRISMA COUNTS — Retrieved: {counts['retrieved']} "
+        f"(ERIC {counts['eric']}, OpenAlex {counts['openalex']}, "
+        f"Semantic Scholar {counts['s2']}, CrossRef {counts.get('crossref', 0)}); "
+        f"Screened after dedup: {counts['screened']}; "
+        f"Included with usable abstracts: {counts['included']}.\n\n"
+        f"INCLUDED PAPERS (your ONLY evidence base):\n\n{context}\n\n"
+        + (LANDSCAPE_INSTRUCTIONS if mode == "landscape"
+           else CONSENSUS_INSTRUCTIONS))
+    return llm_complete(llm, SYSTEM_PROMPT, user_msg)
 
 
 def clean_llm_output(text):
@@ -524,10 +634,7 @@ def extract_open_questions(body, limit=3):
     return qs[:limit]
 
 
-def synthesize_followup(api_key, question, report_title, context, start_n):
-    from google import genai
-    from google.genai import types
-    client = genai.Client(api_key=api_key)
+def synthesize_followup(llm, question, report_title, context, start_n):
     user_msg = (
         f'You previously produced a grounded literature report titled:\n'
         f'"{report_title}"\n\n'
@@ -543,28 +650,9 @@ def synthesize_followup(api_key, question, report_title, context, start_n):
         f"these columns: Finding | Evidence Strength | Key Papers "
         f"(strength EXACTLY one word: Strong, Moderate, or Weak).\n"
         f"Close with one sentence connecting this to the original report's "
-        f"conclusion. Do not add a References section."
-    )
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT, max_output_tokens=8000,
-        temperature=0.2)
-    last_err = None
-    for attempt in range(3):
-        try:
-            resp = client.models.generate_content(
-                model=GEMINI_MODEL, contents=user_msg, config=config)
-            text = resp.text or ""
-            if not text.strip():
-                raise RuntimeError("Gemini returned an empty response — wait "
-                                   "a minute and try the follow-up again.")
-            return text
-        except Exception as e:
-            last_err = e
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                time.sleep(15 * (attempt + 1))
-            else:
-                raise
-    raise last_err
+        f"conclusion. Do not add a References section.")
+    return llm_complete(llm, SYSTEM_PROMPT, user_msg,
+                        max_out=min(8000, PROVIDER_LIMITS[llm["provider"]]["max_out"]))
 
 
 # ==========================================================================
@@ -803,7 +891,7 @@ def _figcap(n, text):
     return f'<div class="figcap"><b>Figure {n}</b>&ensp;{text}</div>'
 
 
-def decorate_report_html(h, counts, included):
+def decorate_report_html(h, counts, included, fig_start=1):
     """Deterministic per-section visuals: numbered section markers, an intro
     stat strip, PRISMA inside Methods, a publication timeline in Results,
     figure captions on the claim matrix and coverage heatmap, question cards,
@@ -816,19 +904,22 @@ def decorate_report_html(h, counts, included):
     h = re.sub(r"<h2>(?!<)(.*?)</h2>",
                r'<h2 class="sec sec-plain"><span>\1</span></h2>', h)
 
-    fig = 1
+    fig = fig_start
+    lit = bool(included) and bool(counts)   # paper-corpus visuals only apply
     # Introduction: stat strip
-    m = re.search(r'<h2 class="sec"><span class="sec-n">01</span><span>[^<]*</span></h2>', h)
-    if m:
-        h = h[:m.end()] + stat_strip_html(included, counts) + h[m.end():]
+    if lit:
+        m = re.search(r'<h2 class="sec"><span class="sec-n">01</span><span>[^<]*</span></h2>', h)
+        if m:
+            h = h[:m.end()] + stat_strip_html(included, counts) + h[m.end():]
     # Methods: PRISMA flow + caption
-    m = re.search(r'<h2 class="sec"><span class="sec-n">02</span><span>[^<]*</span></h2>', h)
+    m = (re.search(r'<h2 class="sec"><span class="sec-n">02</span><span>[^<]*</span></h2>', h)
+         if lit else None)
     if m:
         block = prisma_html(counts) + _figcap(fig, "Search screening and inclusion flow")
         h = h[:m.end()] + block + h[m.end():]
         fig += 1
     # Results: timeline chart (after the Timeline heading, else before Discussion)
-    tl = timeline_html(included)
+    tl = timeline_html(included) if lit else ""
     if tl:
         block = tl + _figcap(fig, "Included papers by publication year")
         m = re.search(r"<h3>Timeline and Venues</h3>", h)
@@ -842,9 +933,11 @@ def decorate_report_html(h, counts, included):
                 h = h[:m.start()] + block + h[m.start():]
                 fig += 1
     # Discussion: caption under the claim/finding matrix
-    m = re.search(r'(<h2 class="sec"><span class="sec-n">04</span>.*?</table>)', h, re.S)
+    m = re.search(r'(<h2 class="sec"><span class="sec-n">0[34]</span>.*?</table>)', h, re.S)
     if m:
-        h = h[:m.end()] + _figcap(fig, "Claims and the strength of evidence behind them") + h[m.end():]
+        cap = ("Claims and the strength of evidence behind them" if lit
+               else "Patterns identified in the retrieved observations")
+        h = h[:m.end()] + _figcap(fig, cap) + h[m.end():]
         fig += 1
     # Conclusion: caption under the coverage heatmap
     m = re.search(r"(<h3>Research Gaps</h3>.*?</table>)", h, re.S)
@@ -1001,10 +1094,33 @@ REPORT_CSS = f"""
   font-size:.85rem; line-height:1.55; }}
 .ref-n {{ font-family:'IBM Plex Mono',monospace; font-weight:600;
   color:{MUTED}; min-width:36px; }}
+
+/* Data Explorer visuals */
+.chart {{ width:100%; height:auto; display:block; margin:14px 0 4px; }}
+.chart .ax {{ font-family:'IBM Plex Mono',monospace; font-size:10px;
+  fill:{MUTED}; }}
+.legend {{ display:flex; flex-wrap:wrap; gap:14px; margin:2px 0 4px; }}
+.lg {{ font-size:.78rem; color:{MUTED}; display:inline-flex;
+  align-items:center; }}
+.lg i {{ width:9px; height:9px; border-radius:50%; margin-right:6px;
+  display:inline-block; }}
+.bars {{ display:flex; flex-direction:column; gap:7px; margin:14px 0 4px; }}
+.brow {{ display:flex; align-items:center; gap:12px; font-size:.85rem; }}
+.blab {{ flex:0 0 176px; color:{INK}; }}
+.btrack {{ flex:1; background:{RULE}; border-radius:4px; height:16px;
+  overflow:hidden; }}
+.bfill {{ display:block; height:100%; background:{GREEN};
+  border-radius:4px 0 0 4px; }}
+.bval {{ flex:0 0 92px; text-align:right;
+  font-family:'IBM Plex Mono',monospace; font-size:.78rem; color:{INK}; }}
+.bmore {{ font-size:.76rem; color:{MUTED}; margin-top:8px; }}
+@media (max-width:640px) {{ .blab {{ flex-basis:110px; }}
+  .bval {{ flex-basis:70px; }} }}
 """
 
 
-def build_html_export(title, question, hero_html, report_html, counts):
+def build_html_export(title, question, hero_html, report_html, counts,
+                      brand="Deep Search Report &middot; ERIC &middot; OpenAlex &middot; Semantic Scholar &middot; CrossRef", subtitle=None):
     t, q = html_lib.escape(title), html_lib.escape(question)
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1047,17 +1163,15 @@ def build_html_export(title, question, hero_html, report_html, counts):
 </style>
 </head>
 <body><div class="wrap"><div class="sheet">
-<div class="brand">Deep Search Report &middot; ERIC &middot; OpenAlex &middot; Semantic Scholar</div>
+<div class="brand">{brand}</div>
 <h1 class="headline">{t}</h1>
-<div class="subtitle">{q} &middot; Generated {date.today().strftime("%B %d, %Y")}
- &middot; {counts["included"]} papers synthesized from {counts["retrieved"]} retrieved records</div>
+<div class="subtitle">{subtitle or (q + " &middot; Generated " + date.today().strftime("%B %d, %Y") + " &middot; " + str(counts["included"]) + " papers synthesized from " + str(counts["retrieved"]) + " retrieved records")}</div>
 {hero_html}
 <div class="report-doc">
 {report_html}
 </div>
-<div class="footer">Generated with the Education Literature Review Assistant.
-Every citation refers to the numbered References list above, built directly
-from the retrieved records.</div>
+<div class="footer">Generated with the Education Research Assistant.
+Every figure and citation is grounded in the retrieved records shown above.</div>
 </div></div></body></html>"""
 
 
@@ -1176,321 +1290,995 @@ button[data-testid="stBaseButton-primary"] p {{ color:#FFFFFF !important; }}
 </style>
 """
 
+
+# ==========================================================================
+# Data Explorer — curated catalog + fetchers for World Bank, Census, NCES
+# ==========================================================================
+
+FIPS = {
+    "01": "Alabama", "02": "Alaska", "04": "Arizona", "05": "Arkansas",
+    "06": "California", "08": "Colorado", "09": "Connecticut",
+    "10": "Delaware", "11": "District of Columbia", "12": "Florida",
+    "13": "Georgia", "15": "Hawaii", "16": "Idaho", "17": "Illinois",
+    "18": "Indiana", "19": "Iowa", "20": "Kansas", "21": "Kentucky",
+    "22": "Louisiana", "23": "Maine", "24": "Maryland",
+    "25": "Massachusetts", "26": "Michigan", "27": "Minnesota",
+    "28": "Mississippi", "29": "Missouri", "30": "Montana",
+    "31": "Nebraska", "32": "Nevada", "33": "New Hampshire",
+    "34": "New Jersey", "35": "New Mexico", "36": "New York",
+    "37": "North Carolina", "38": "North Dakota", "39": "Ohio",
+    "40": "Oklahoma", "41": "Oregon", "42": "Pennsylvania",
+    "44": "Rhode Island", "45": "South Carolina", "46": "South Dakota",
+    "47": "Tennessee", "48": "Texas", "49": "Utah", "50": "Vermont",
+    "51": "Virginia", "53": "Washington", "54": "West Virginia",
+    "55": "Wisconsin", "56": "Wyoming", "72": "Puerto Rico",
+}
+
+COUNTRY_SETS = {
+    "United States only": "USA",
+    "US + comparison peers": "USA;GBR;CAN;AUS;DEU;FIN;JPN;KOR",
+    "G7": "USA;GBR;CAN;FRA;DEU;ITA;JPN",
+    "World aggregate": "WLD",
+    "US vs. World & OECD": "USA;WLD;OED",
+}
+
+# Every entry maps to a verified API call pattern. The model may only choose
+# from this list — it never writes indicator codes, so it cannot invent one.
+DATA_CATALOG = [
+    # --- World Bank (free, no key) ---------------------------------------
+    {"id": "wb_edu_gdp", "src": "World Bank", "kind": "wb",
+     "code": "SE.XPD.TOTL.GD.ZS", "unit": "% of GDP",
+     "label": "Government expenditure on education (% of GDP)"},
+    {"id": "wb_edu_govt", "src": "World Bank", "kind": "wb",
+     "code": "SE.XPD.TOTL.GB.ZS", "unit": "% of gov. spending",
+     "label": "Education spending (% of government expenditure)"},
+    {"id": "wb_ter_enr", "src": "World Bank", "kind": "wb",
+     "code": "SE.TER.ENRR", "unit": "% gross",
+     "label": "Tertiary school enrollment (% gross)"},
+    {"id": "wb_sec_enr", "src": "World Bank", "kind": "wb",
+     "code": "SE.SEC.ENRR", "unit": "% gross",
+     "label": "Secondary school enrollment (% gross)"},
+    {"id": "wb_prm_enr", "src": "World Bank", "kind": "wb",
+     "code": "SE.PRM.ENRR", "unit": "% gross",
+     "label": "Primary school enrollment (% gross)"},
+    {"id": "wb_pupil_teacher", "src": "World Bank", "kind": "wb",
+     "code": "SE.PRM.ENRL.TC.ZS", "unit": "pupils per teacher",
+     "label": "Pupil-teacher ratio, primary"},
+    {"id": "wb_prm_compl", "src": "World Bank", "kind": "wb",
+     "code": "SE.PRM.CMPT.ZS", "unit": "% of relevant age group",
+     "label": "Primary completion rate"},
+    {"id": "wb_literacy", "src": "World Bank", "kind": "wb",
+     "code": "SE.ADT.LITR.ZS", "unit": "% of people 15+",
+     "label": "Adult literacy rate"},
+    {"id": "wb_youth_neet", "src": "World Bank", "kind": "wb",
+     "code": "SL.UEM.NEET.ZS", "unit": "% of youth",
+     "label": "Youth not in education, employment or training (NEET)"},
+    {"id": "wb_gdp_pc", "src": "World Bank", "kind": "wb",
+     "code": "NY.GDP.PCAP.CD", "unit": "current US$",
+     "label": "GDP per capita (context indicator)"},
+
+    # --- U.S. Census ACS 5-year (free, keyless for moderate use) ----------
+    {"id": "cs_ba", "src": "U.S. Census", "kind": "census_pct",
+     "num": "B15003_022E", "den": "B15003_001E", "unit": "% of adults 25+",
+     "label": "Adults 25+ with a bachelor's degree"},
+    {"id": "cs_grad", "src": "U.S. Census", "kind": "census_pct",
+     "num": "B15003_023E", "den": "B15003_001E", "unit": "% of adults 25+",
+     "label": "Adults 25+ with a master's degree"},
+    {"id": "cs_hs", "src": "U.S. Census", "kind": "census_pct",
+     "num": "B15003_017E", "den": "B15003_001E", "unit": "% of adults 25+",
+     "label": "Adults 25+ with a high school diploma"},
+    {"id": "cs_income", "src": "U.S. Census", "kind": "census_val",
+     "num": "B19013_001E", "unit": "US$",
+     "label": "Median household income"},
+    {"id": "cs_poverty", "src": "U.S. Census", "kind": "census_pct",
+     "num": "B17001_002E", "den": "B17001_001E", "unit": "% of population",
+     "label": "Population below the poverty line"},
+    {"id": "cs_enrolled", "src": "U.S. Census", "kind": "census_pct",
+     "num": "B14001_002E", "den": "B14001_001E", "unit": "% of population 3+",
+     "label": "Population enrolled in school"},
+
+    # --- NCES via Urban Institute summary endpoints (free, no key) -------
+    {"id": "nces_enroll", "src": "NCES", "kind": "nces",
+     "section": "schools", "source": "ccd", "topic": "enrollment",
+     "var": "enrollment", "stat": "sum", "unit": "students",
+     "label": "Public school enrollment (CCD)"},
+    {"id": "nces_teachers", "src": "NCES", "kind": "nces",
+     "section": "schools", "source": "ccd", "topic": "directory",
+     "var": "teachers_fte", "stat": "sum", "unit": "FTE teachers",
+     "label": "Public school teachers, full-time equivalent (CCD)"},
+    {"id": "nces_frpl", "src": "NCES", "kind": "nces",
+     "section": "schools", "source": "ccd", "topic": "directory",
+     "var": "free_or_reduced_price_lunch", "stat": "sum", "unit": "students",
+     "label": "Students eligible for free/reduced-price lunch (CCD)"},
+    {"id": "nces_dist_rev", "src": "NCES", "kind": "nces",
+     "section": "school-districts", "source": "ccd", "topic": "finance",
+     "var": "rev_total", "stat": "sum", "unit": "US$",
+     "label": "School district total revenue (CCD finance)"},
+]
+
+CATALOG_BY_ID = {d["id"]: d for d in DATA_CATALOG}
+
+
+def _num(x):
+    try:
+        v = float(x)
+        return None if v <= -666666666 else v      # Census null sentinels
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_worldbank(entry, countries, y0, y1):
+    rows = []
+    try:
+        r = requests.get(
+            f"https://api.worldbank.org/v2/country/{countries}/indicator/{entry['code']}",
+            params={"format": "json", "per_page": 2000, "date": f"{y0}:{y1}"},
+            headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        payload = r.json()
+        if not isinstance(payload, list) or len(payload) < 2 or not payload[1]:
+            st.warning("World Bank returned no observations for that "
+                       "indicator and period.")
+            return rows
+        for o in payload[1]:
+            v = _num(o.get("value"))
+            if v is None:
+                continue
+            rows.append({"entity": (o.get("country") or {}).get("value", "?"),
+                         "year": int(o["date"]), "value": v})
+    except Exception as e:
+        st.warning(f"World Bank didn't respond ({e}).")
+    return rows
+
+
+def fetch_census(entry, year, census_key=""):
+    rows, get = [], entry["num"] + (
+        "," + entry["den"] if entry.get("den") else "")
+    params = {"get": "NAME," + get, "for": "state:*"}
+    if census_key:
+        params["key"] = census_key
+    try:
+        r = requests.get(f"https://api.census.gov/data/{year}/acs/acs5",
+                         params=params, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        table = r.json()
+        cols = table[0]
+        for rec in table[1:]:
+            d = dict(zip(cols, rec))
+            num = _num(d.get(entry["num"]))
+            if num is None:
+                continue
+            if entry.get("den"):
+                den = _num(d.get(entry["den"]))
+                if not den:
+                    continue
+                val = num / den * 100
+            else:
+                val = num
+            rows.append({"entity": d.get("NAME", "?"), "year": int(year),
+                         "value": val})
+    except Exception as e:
+        st.warning(f"Census didn't respond ({e}). ACS 5-year data for "
+                   f"{year} may not be published yet — try an earlier year.")
+    return rows
+
+
+def fetch_nces(entry, y0, y1):
+    """Urban Institute summary endpoints aggregate NCES data by state-year."""
+    rows = []
+    url = (f"https://educationdata.urban.org/api/v1/{entry['section']}/"
+           f"{entry['source']}/{entry['topic']}/summaries")
+    params = {"var": entry["var"], "stat": entry["stat"], "by": "fips",
+              "year": ",".join(str(y) for y in range(y0, y1 + 1))}
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=45)
+        r.raise_for_status()
+        payload = r.json()
+        recs = payload.get("results", payload) if isinstance(payload, dict) else payload
+        for o in recs or []:
+            v = _num(o.get(entry["var"]))
+            fips = str(o.get("fips", "")).zfill(2)
+            if v is None or fips not in FIPS:
+                continue
+            rows.append({"entity": FIPS[fips], "year": int(o.get("year", y1)),
+                         "value": v})
+    except Exception as e:
+        st.warning(f"NCES (Urban Institute) didn't respond ({e}).")
+    return rows
+
+
+def load_dataset(entry, opts):
+    if entry["kind"] == "wb":
+        rows = fetch_worldbank(entry, opts["countries"], opts["y0"], opts["y1"])
+        note = ("World Bank Open Data, indicator "
+                f"{entry['code']}, {opts['y0']}\u2013{opts['y1']}")
+    elif entry["kind"].startswith("census"):
+        rows = fetch_census(entry, opts["census_year"], opts.get("census_key", ""))
+        note = (f"U.S. Census ACS 5-year {opts['census_year']}, "
+                f"variable {entry['num']}"
+                + (f" over {entry['den']}" if entry.get("den") else "")
+                + ", all states")
+    else:
+        rows = fetch_nces(entry, opts["y0"], opts["y1"])
+        note = (f"NCES {entry['source'].upper()} via the Urban Institute "
+                f"Education Data Portal, {entry['var']} "
+                f"({entry['stat']}) by state, {opts['y0']}\u2013{opts['y1']}")
+    years = {r["year"] for r in rows}
+    return {"entry": entry, "rows": rows, "note": note,
+            "shape": "series" if len(years) > 1 else "cross"}
+
+
+# ---- Deterministic data visuals -----------------------------------------
+
+SERIES_COLORS = [GREEN, "#2456A6", AMBER, "#6B4FA8", RED, "#3C7D8C",
+                 "#8A6D3B", "#4F6B2F"]
+
+
+def _fmt(v, unit=""):
+    a = abs(v)
+    if a >= 1_000_000_000:
+        s = f"{v/1_000_000_000:,.1f}B"
+    elif a >= 1_000_000:
+        s = f"{v/1_000_000:,.1f}M"
+    elif a >= 10_000:
+        s = f"{v:,.0f}"
+    elif a >= 100:
+        s = f"{v:,.1f}"
+    else:
+        s = f"{v:,.2f}".rstrip("0").rstrip(".")
+    return s + ("%" if unit.startswith("%") else "")
+
+
+def data_stats_html(ds):
+    rows, unit = ds["rows"], ds["entry"]["unit"]
+    if not rows:
+        return ""
+    vals = [r["value"] for r in rows]
+    years = sorted({r["year"] for r in rows})
+    latest = [r for r in rows if r["year"] == years[-1]]
+    hi = max(latest, key=lambda r: r["value"])
+    lo = min(latest, key=lambda r: r["value"])
+    avg = sum(r["value"] for r in latest) / len(latest)
+    stats = [(str(len({r["entity"] for r in rows})), "Entities"),
+             (f"{years[0]}&ndash;{years[-1]}" if len(years) > 1 else str(years[0]),
+              "Period covered"),
+             (_fmt(avg, unit), f"Mean, {years[-1]}"),
+             (_fmt(hi["value"], unit), f"Highest: {html_lib.escape(hi['entity'])[:18]}"),
+             (_fmt(lo["value"], unit), f"Lowest: {html_lib.escape(lo['entity'])[:18]}")]
+    cells = "".join(f'<div class="stat"><div class="stat-n">{n}</div>'
+                    f'<div class="stat-l">{l}</div></div>' for n, l in stats)
+    return f'<div class="stats">{cells}</div>'
+
+
+def series_chart_html(ds, max_entities=8):
+    """Multi-series line chart as inline SVG — no JS, prints cleanly."""
+    rows = ds["rows"]
+    years = sorted({r["year"] for r in rows})
+    if len(years) < 2:
+        return ""
+    totals = {}
+    for r in rows:
+        totals.setdefault(r["entity"], []).append(r["value"])
+    ents = sorted(totals, key=lambda e: -max(totals[e]))[:max_entities]
+    vals = [r["value"] for r in rows if r["entity"] in ents]
+    vmin, vmax = min(vals), max(vals)
+    if vmax == vmin:
+        vmax = vmin + 1
+    pad = (vmax - vmin) * 0.08
+    vmin, vmax = vmin - pad, vmax + pad
+    W, H, L, R, T, B = 720, 260, 62, 12, 12, 34
+    px = lambda y: L + (W - L - R) * (years.index(y) / max(len(years) - 1, 1))
+    py = lambda v: T + (H - T - B) * (1 - (v - vmin) / (vmax - vmin))
+    parts = [f'<svg viewBox="0 0 {W} {H}" class="chart" '
+             f'xmlns="http://www.w3.org/2000/svg" role="img">']
+    for k in range(5):                                   # gridlines + y labels
+        v = vmin + (vmax - vmin) * k / 4
+        y = py(v)
+        parts.append(f'<line x1="{L}" y1="{y:.1f}" x2="{W-R}" y2="{y:.1f}" '
+                     f'stroke="{RULE}" stroke-width="1"/>')
+        parts.append(f'<text x="{L-8}" y="{y+3.5:.1f}" text-anchor="end" '
+                     f'class="ax">{_fmt(v, ds["entry"]["unit"])}</text>')
+    step = max(1, len(years) // 8)
+    for i, yr in enumerate(years):                       # x labels
+        if i % step == 0 or i == len(years) - 1:
+            parts.append(f'<text x="{px(yr):.1f}" y="{H-12}" '
+                         f'text-anchor="middle" class="ax">{yr}</text>')
+    for i, e in enumerate(ents):                         # one path per entity
+        pts = sorted((r for r in rows if r["entity"] == e),
+                     key=lambda r: r["year"])
+        if len(pts) < 2:
+            continue
+        c = SERIES_COLORS[i % len(SERIES_COLORS)]
+        d = " ".join(f'{"M" if j == 0 else "L"}{px(p["year"]):.1f},'
+                     f'{py(p["value"]):.1f}' for j, p in enumerate(pts))
+        parts.append(f'<path d="{d}" fill="none" stroke="{c}" '
+                     f'stroke-width="2.2" stroke-linejoin="round"/>')
+        last = pts[-1]
+        parts.append(f'<circle cx="{px(last["year"]):.1f}" '
+                     f'cy="{py(last["value"]):.1f}" r="3" fill="{c}"/>')
+    parts.append("</svg>")
+    legend = "".join(
+        f'<span class="lg"><i style="background:'
+        f'{SERIES_COLORS[i % len(SERIES_COLORS)]}"></i>'
+        f'{html_lib.escape(e)}</span>' for i, e in enumerate(ents))
+    return "".join(parts) + f'<div class="legend">{legend}</div>'
+
+
+def bar_chart_html(ds, top_n=15):
+    """Ranked horizontal bars for a single-year cross-section."""
+    rows = ds["rows"]
+    years = sorted({r["year"] for r in rows})
+    if not rows:
+        return ""
+    latest = [r for r in rows if r["year"] == years[-1]]
+    latest.sort(key=lambda r: -r["value"])
+    shown = latest[:top_n]
+    mx = max(r["value"] for r in shown) or 1
+    unit = ds["entry"]["unit"]
+    bars = "".join(
+        f'<div class="brow"><span class="blab">{html_lib.escape(r["entity"])[:26]}</span>'
+        f'<span class="btrack"><span class="bfill" style="width:'
+        f'{max(r["value"] / mx * 100, 0.6):.1f}%"></span></span>'
+        f'<span class="bval">{_fmt(r["value"], unit)}</span></div>'
+        for r in shown)
+    more = (f'<div class="bmore">Showing the top {len(shown)} of '
+            f'{len(latest)} entities for {years[-1]}.</div>'
+            if len(latest) > len(shown) else "")
+    return f'<div class="bars">{bars}</div>{more}'
+
+
+def data_table_html(ds, limit=60):
+    rows = sorted(ds["rows"], key=lambda r: (-r["year"], -r["value"]))[:limit]
+    unit = ds["entry"]["unit"]
+    body = "".join(
+        f'<tr><td>{html_lib.escape(r["entity"])}</td><td>{r["year"]}</td>'
+        f'<td>{_fmt(r["value"], unit)}</td></tr>' for r in rows)
+    cap = (f'<div class="bmore">Showing {len(rows)} of {len(ds["rows"])} '
+           f'observations. The CSV download contains all of them.</div>'
+           if len(ds["rows"]) > len(rows) else "")
+    return (f'<table><thead><tr><th>Entity</th><th>Year</th>'
+            f'<th>Value ({html_lib.escape(unit)})</th></tr></thead>'
+            f'<tbody>{body}</tbody></table>{cap}')
+
+
+def make_csv(ds):
+    out = ["entity,year,value,indicator,unit,source"]
+    lab = ds["entry"]["label"].replace('"', "'")
+    for r in sorted(ds["rows"], key=lambda r: (r["entity"], r["year"])):
+        out.append(f'"{r["entity"]}",{r["year"]},{r["value"]},'
+                   f'"{lab}","{ds["entry"]["unit"]}","{ds["entry"]["src"]}"')
+    return "\n".join(out)
+
+
+DATA_SYSTEM_PROMPT = """You are a careful education-data analyst.
+
+GROUNDING RULES (non-negotiable):
+- Use ONLY the observations supplied in the user message. Never introduce
+  outside figures, recalled statistics, or events not visible in the data.
+- Every number you state must appear in, or be arithmetic on, the supplied
+  observations. Round sensibly and say which year each figure refers to.
+- Describe patterns, not causes. These are observational aggregates: say
+  "is associated with" rather than "causes", and name confounders you cannot
+  rule out with this data alone.
+- If the data cannot answer part of the question, say so plainly."""
+
+DATA_INSTRUCTIONS = """Write a raw-Markdown analysis — no code fences, no
+preamble, no extra sections — with EXACTLY this structure:
+
+Line 1:
+REPORT_TITLE: <one declarative sentence stating the main pattern, max 16 words>
+
+## 1. Overview
+2-3 paragraphs: what the indicator measures, the headline pattern across
+entities and years, and the overall magnitude of variation.
+
+## 2. Data & Method
+One paragraph naming the source, indicator, geography, period, and the number
+of observations retrieved, plus any coverage gaps you can see in the data.
+
+## 3. Key Patterns
+2-3 short paragraphs on the most notable movements, leaders, and laggards.
+Then a Markdown table with EXACTLY these columns:
+Pattern | What The Data Show | Confidence
+Confidence must be EXACTLY one word: Strong, Moderate, or Weak — judged by how
+many observations and years support the pattern.
+
+## 4. Caveats
+One paragraph on what this data cannot establish: definitional differences,
+missing years or entities, and why these aggregates cannot support causal
+claims.
+
+## 5. Takeaways
+3-4 bullet points, each stating one grounded finding with its figure and year."""
+
+
+def analyze_data(llm, question, ds):
+    rows = sorted(ds["rows"], key=lambda r: (r["entity"], r["year"]))
+    lim = PROVIDER_LIMITS[llm["provider"]]
+    budget = 120 if lim["max_out"] <= 4000 else 400
+    if len(rows) > budget:                 # keep every entity's endpoints
+        by_ent = {}
+        for r in rows:
+            by_ent.setdefault(r["entity"], []).append(r)
+        rows, per = [], max(2, budget // max(len(by_ent), 1))
+        for e, rs in by_ent.items():
+            rows += rs[:1] + rs[-(per - 1):] if len(rs) > per else rs
+    lines = "\n".join(f"{r['entity']} | {r['year']} | {r['value']:.4g}"
+                      for r in rows)
+    user_msg = (
+        f"QUESTION: {question}\n\n"
+        f"INDICATOR: {ds['entry']['label']} (unit: {ds['entry']['unit']})\n"
+        f"SOURCE: {ds['note']}\n"
+        f"TOTAL OBSERVATIONS RETRIEVED: {len(ds['rows'])}\n\n"
+        f"OBSERVATIONS (entity | year | value) — your ONLY evidence:\n{lines}\n\n"
+        + DATA_INSTRUCTIONS)
+    return llm_complete(llm, DATA_SYSTEM_PROMPT, user_msg)
+
+
+def pick_indicator(llm, question):
+    """Constrained selection: the model must return one catalog id, so it can
+    never invent an indicator code. Falls back to keyword matching."""
+    menu = "\n".join(f"{d['id']}: {d['label']} ({d['src']})"
+                     for d in DATA_CATALOG)
+    try:
+        out = llm_complete(
+            llm,
+            "You map a user's data question to exactly one dataset id from a "
+            "fixed list. Reply with the id only — no punctuation, no "
+            "explanation. If nothing fits well, reply with the closest id.",
+            f"QUESTION: {question}\n\nAVAILABLE DATASET IDS:\n{menu}\n\n"
+            f"Reply with exactly one id from the list above.",
+            max_out=24).strip().split()[0].strip(".,:`'\"")
+        if out in CATALOG_BY_ID:
+            return CATALOG_BY_ID[out], None
+    except Exception as e:
+        pass
+    words = {w for w in re.findall(r"[a-z]{4,}", question.lower())}
+    best, score = None, 0
+    for d in DATA_CATALOG:
+        s = len(words & set(re.findall(r"[a-z]{4,}", d["label"].lower())))
+        if s > score:
+            best, score = d, s
+    return (best or DATA_CATALOG[0]), "keyword match"
+
 # ==========================================================================
 # Streamlit UI
 # ==========================================================================
 
-st.set_page_config(page_title="Literature Review Assistant",
+st.set_page_config(page_title="Education Research Assistant",
                    page_icon="📖", layout="wide")
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
-EXAMPLES = [
+LIT_EXAMPLES = [
     "Does retrieval practice improve K-12 science learning?",
-    "What are the effects of class size on student achievement?",
+    "What barriers do first-generation students face?",
     "Does one-to-one device access improve literacy outcomes?",
+]
+DATA_EXAMPLES = [
+    "How has US education spending changed versus peer countries?",
+    "Which states have the highest share of adults with a bachelor's degree?",
+    "How has public school enrollment shifted across states?",
 ]
 
 
-def _set_example(text):
+def _set_lit(text):
     st.session_state.q_input = text
 
 
+def _set_data(text):
+    st.session_state.dq_input = text
+
+
+# ---- Sidebar: model provider + keys --------------------------------------
 with st.sidebar:
-    st.markdown("#### Setup")
-    api_key = st.text_input(
-        "Gemini API key", type="password",
-        value=os.environ.get("GEMINI_API_KEY", ""),
-        help="Paste a key from Google AI Studio. The free tier of "
-             f"{GEMINI_MODEL} is enough — no billing needed.")
-    st.markdown(
-        "[Get a free key at aistudio.google.com/apikey]"
-        "(https://aistudio.google.com/apikey)")
+    st.markdown("#### Model")
+    provider_label = st.radio(
+        "Model provider", ["Google Gemini (free)", "GitHub Models (GPT-4.1)"],
+        label_visibility="collapsed",
+        help="Gemini's free tier allows much larger requests. GitHub Models "
+             "gives you GPT-4.1 but caps free requests at 8k in / 4k out, so "
+             "reports are built from a trimmed evidence set.")
+    provider = "gemini" if provider_label.startswith("Google") else "github"
+
+    if provider == "gemini":
+        api_key = st.text_input(
+            "Gemini API key", type="password",
+            value=os.environ.get("GEMINI_API_KEY", ""),
+            help="Free key from Google AI Studio — no billing required.")
+        st.markdown("[Get a free key at aistudio.google.com/apikey]"
+                    "(https://aistudio.google.com/apikey)")
+    else:
+        api_key = st.text_input(
+            "GitHub personal access token", type="password",
+            value=os.environ.get("GITHUB_TOKEN", ""),
+            help="A PAT with the models:read permission. Free tier is rate "
+                 "limited to roughly 150 requests/day.")
+        st.markdown("[Create a token with models:read]"
+                    "(https://github.com/settings/personal-access-tokens)")
+        st.caption("Free GitHub Models requests cap at 8k input tokens, so "
+                   "literature reports use up to 12 papers instead of 25.")
+
+    llm = {"provider": provider, "key": api_key}
+
+    st.divider()
+    st.markdown("#### Optional keys")
     s2_key = st.text_input(
-        "Semantic Scholar API key (optional)", type="password",
+        "Semantic Scholar key", type="password",
         value=os.environ.get("S2_API_KEY", ""),
         help="Anonymous Semantic Scholar requests share one rate limit and "
-             "often fail. A free key from semanticscholar.org/product/api "
-             "makes that source reliable.")
+             "often fail. A free key makes that source reliable.")
+    census_key = st.text_input(
+        "U.S. Census key", type="password",
+        value=os.environ.get("CENSUS_API_KEY", ""),
+        help="Optional. Census works without a key for moderate use.")
+
     st.divider()
     st.markdown("#### About")
     st.markdown(
-        "Searches **ERIC**, **OpenAlex**, and **Semantic Scholar**, then "
-        "synthesizes the results into a five-section evidence report. Every "
-        "claim is cited to a retrieved paper — the model is not allowed to "
-        "use outside knowledge.")
+        "**Literature review** searches ERIC, OpenAlex, Semantic Scholar, and "
+        "CrossRef, then synthesizes a grounded evidence report.\n\n"
+        "**Data explorer** pulls real statistics from the World Bank, U.S. "
+        "Census, and NCES, then analyzes them. In both modes the model may "
+        "only use what was retrieved.")
 
+# ---- Header + mode switch ------------------------------------------------
 st.markdown(
-    '<div class="app-eyebrow">ERIC &middot; OpenAlex &middot; Semantic Scholar</div>'
-    '<p class="app-title">Education Literature Review Assistant</p>'
-    '<p class="app-sub">Ask a research question. Get a grounded, citable '
-    'evidence report with a consensus verdict, claim matrix, and gap map.</p>',
+    '<div class="app-eyebrow">ERIC &middot; OpenAlex &middot; Semantic Scholar '
+    '&middot; CrossRef &middot; World Bank &middot; Census &middot; NCES</div>'
+    '<p class="app-title">Education Research Assistant</p>'
+    '<p class="app-sub">Synthesize the literature, or analyze real statistics '
+    '\u2014 both grounded strictly in what the APIs return.</p>',
     unsafe_allow_html=True)
-
 st.write("")
-question = st.text_area(
-    "Research question", key="q_input", height=100,
-    placeholder="e.g., Does retrieval practice improve K-12 science learning?",
-    label_visibility="collapsed")
 
-ec1, ec2 = st.columns([3, 1])
-with ec1:
-    bcols = st.columns(len(EXAMPLES))
-    for col, ex in zip(bcols, EXAMPLES):
-        with col:
-            st.button(ex.split("?")[0][:38] + "…", key=f"ex_{ex[:12]}",
-                      on_click=_set_example, args=(ex,),
-                      use_container_width=True, help=ex)
-with ec2:
-    run = st.button("Run deep search", type="primary", use_container_width=True)
+app_mode = st.radio(
+    "Mode", ["📚 Literature review", "📊 Data explorer"],
+    horizontal=True, label_visibility="collapsed")
+st.write("")
 
-if run:
-    if not question.strip():
-        st.error("Type a research question first — or tap one of the examples.")
-        st.stop()
-    if not api_key:
-        st.error("Add your free Gemini API key in the sidebar to run the "
-                 "synthesis step. The link there takes you to Google AI Studio.")
-        st.stop()
+# ==========================================================================
+# MODE 1 — Literature review
+# ==========================================================================
+if app_mode.endswith("Literature review"):
+    question = st.text_area(
+        "Research question", key="q_input", height=100,
+        placeholder="e.g., Does retrieval practice improve K-12 science learning?",
+        label_visibility="collapsed")
 
-    q = question.strip()
-    with st.status("Running deep search…", expanded=True) as status:
-        st.write("Searching ERIC…")
-        eric = fetch_eric(q)
-        st.write(f"ERIC returned {len(eric)}. Searching OpenAlex…")
-        oa = fetch_openalex(q)
-        st.write(f"OpenAlex returned {len(oa)}. Searching Semantic Scholar…")
-        s2 = fetch_semantic_scholar(q, s2_key)
-        st.write(f"Semantic Scholar returned {len(s2)}. Screening and deduplicating…")
+    ec1, ec2 = st.columns([3, 1])
+    with ec1:
+        bcols = st.columns(len(LIT_EXAMPLES))
+        for col, ex in zip(bcols, LIT_EXAMPLES):
+            with col:
+                st.button(ex.split("?")[0][:36] + "…", key=f"ex_{ex[:12]}",
+                          on_click=_set_lit, args=(ex,),
+                          use_container_width=True, help=ex)
+    with ec2:
+        run = st.button("Run deep search", type="primary",
+                        use_container_width=True)
 
-        all_papers = eric + oa + s2
-        screened, included = dedupe_and_screen(all_papers)
-        counts = {"retrieved": len(all_papers), "eric": len(eric),
-                  "openalex": len(oa), "s2": len(s2),
-                  "screened": len(screened), "included": len(included)}
-
-        if not included:
-            status.update(label="No usable papers found", state="error")
-            st.error("None of the retrieved records had usable abstracts. "
-                     "Try broader wording — for example, drop grade levels or "
-                     "specific program names.")
+    if run:
+        if not question.strip():
+            st.error("Type a research question first — or tap one of the examples.")
+            st.stop()
+        if not api_key:
+            st.error("Add your API key in the sidebar to run the synthesis step.")
             st.stop()
 
-        mode = question_mode(q)
-        st.write(f"{counts['included']} papers included. Synthesizing with Gemini "
-                 f"({'findings landscape' if mode == 'landscape' else 'consensus'} report)…")
-        try:
-            raw = clean_llm_output(
-                synthesize(api_key, q, build_context(included), counts, mode))
-        except Exception as e:
-            status.update(label="Synthesis failed", state="error")
-            st.error(f"Synthesis failed: {e}")
+        q = question.strip()
+        lim = PROVIDER_LIMITS[provider]
+        with st.status("Running deep search…", expanded=True) as status:
+            st.write("Searching ERIC…")
+            eric = fetch_eric(q)
+            st.write(f"ERIC returned {len(eric)}. Searching OpenAlex…")
+            oa = fetch_openalex(q)
+            st.write(f"OpenAlex returned {len(oa)}. Searching Semantic Scholar…")
+            s2 = fetch_semantic_scholar(q, s2_key)
+            st.write(f"Semantic Scholar returned {len(s2)}. Searching CrossRef…")
+            cr = fetch_crossref(q)
+            st.write(f"CrossRef returned {len(cr)}. Screening and deduplicating…")
+
+            all_papers = eric + oa + s2 + cr
+            screened, included = dedupe_and_screen(
+                all_papers, max_included=lim["max_papers"])
+            counts = {"retrieved": len(all_papers), "eric": len(eric),
+                      "openalex": len(oa), "s2": len(s2), "crossref": len(cr),
+                      "screened": len(screened), "included": len(included)}
+
+            if not included:
+                status.update(label="No usable papers found", state="error")
+                st.error("None of the retrieved records had usable abstracts. "
+                         "Try broader wording — for example, drop grade levels "
+                         "or specific program names.")
+                st.stop()
+
+            mode = question_mode(q)
+            st.write(f"{counts['included']} papers included. Synthesizing with "
+                     f"{'Gemini' if provider == 'gemini' else 'GPT-4.1'} "
+                     f"({'findings landscape' if mode == 'landscape' else 'consensus'} "
+                     f"report)…")
+            try:
+                raw = clean_llm_output(synthesize(
+                    llm, q,
+                    build_context(included, abstract_chars=lim["abstract_chars"]),
+                    counts, mode))
+            except Exception as e:
+                status.update(label="Synthesis failed", state="error")
+                st.error(f"Synthesis failed: {e}")
+                st.stop()
+            status.update(label="Report ready", state="complete", expanded=False)
+
+        meter, body = parse_meter(raw)
+        findings, body = parse_findings(body)
+        title, body = parse_title(body, q)
+        for k in [k for k in st.session_state if str(k).startswith("sel_")]:
+            del st.session_state[k]
+        st.session_state.result = {
+            "question": q, "title": title, "meter": meter, "findings": findings,
+            "mode": mode, "body": body, "counts": counts, "included": included,
+        }
+
+    if "result" not in st.session_state:
+        st.markdown(
+            '<div class="how-row">'
+            '<div class="how-card"><div class="how-step">Search</div>'
+            '<div class="how-title">Four free databases</div>'
+            '<div class="how-body">ERIC, OpenAlex, Semantic Scholar, and '
+            'CrossRef — up to 60 records per search.</div></div>'
+            '<div class="how-card"><div class="how-step">Screen</div>'
+            '<div class="how-title">PRISMA-style screening</div>'
+            '<div class="how-body">Duplicates merged, papers without usable '
+            'abstracts excluded, ranked by citation count.</div></div>'
+            '<div class="how-card"><div class="how-step">Synthesize</div>'
+            '<div class="how-title">Grounded report</div>'
+            '<div class="how-body">A five-section report where every claim '
+            'cites a retrieved paper. Export to BibTeX or print-ready HTML.'
+            '</div></div></div>', unsafe_allow_html=True)
+
+    if "result" in st.session_state:
+        r = st.session_state.result
+        meter, counts = r["meter"], r["counts"]
+        full_body = r["body"] + "\n\n" + make_references_md(r["included"])
+        report_html = decorate_report_html(
+            render_report_html(full_body), counts, r["included"])
+
+        st.divider()
+        st.markdown(
+            '<div class="result-head">'
+            f'<div class="result-title">{html_lib.escape(r["title"])}</div>'
+            f'<div class="result-meta">{html_lib.escape(r["question"])} &middot; '
+            f'Generated {date.today().strftime("%B %d, %Y")} &middot; '
+            f'{counts["included"]} papers synthesized from '
+            f'{counts["retrieved"]} retrieved records</div></div>',
+            unsafe_allow_html=True)
+
+        if r.get("mode") == "landscape" and r.get("findings"):
+            st.markdown(findings_hero_html(r["findings"]), unsafe_allow_html=True)
+        elif meter:
+            st.markdown(verdict_html(meter), unsafe_allow_html=True)
+
+        hero = (findings_hero_html(r["findings"])
+                if r.get("mode") == "landscape" and r.get("findings")
+                else verdict_html(meter))
+        html_out = build_html_export(r["title"], r["question"], hero,
+                                     report_html, counts)
+        dl1, dl2, _sp = st.columns([1, 1, 1])
+        with dl1:
+            st.download_button("Download report (HTML)", html_out,
+                               file_name="deep_search_report.html",
+                               mime="text/html", use_container_width=True,
+                               type="primary")
+        with dl2:
+            st.download_button("Download bibliography (.bib)",
+                               make_bibtex(r["included"]),
+                               file_name="literature_review.bib",
+                               mime="text/plain", use_container_width=True)
+        st.caption("Open the HTML report in a browser and press Ctrl+P / Cmd+P "
+                   "for a clean PDF. To pick which papers go to Zotero, use "
+                   "the Zotero export tab.")
+
+        if "## 5" not in r["body"]:
+            st.warning("This report looks shorter than expected — it may have "
+                       "been truncated. Running the search again usually fixes it.")
+
+        tab_report, tab_papers, tab_export = st.tabs(
+            ["Report", f"Included papers ({counts['included']})", "Zotero export"])
+
+        with tab_report:
+            st.markdown(f'<div class="report-doc">{report_html}</div>',
+                        unsafe_allow_html=True)
+
+        with tab_papers:
+            st.markdown("These are the only records the synthesis was allowed "
+                        "to cite. Bracketed numbers in the report refer to "
+                        "this list.")
+            st.markdown(papers_html(r["included"]), unsafe_allow_html=True)
+
+        with tab_export:
+            st.markdown("Choose which papers to include, then download the "
+                        ".bib file and import it into Zotero via "
+                        "**File → Import**.")
+
+            def _set_all(value):
+                for k in range(len(r["included"])):
+                    st.session_state[f"sel_{k}"] = value
+
+            b1, b2, _bsp = st.columns([1, 1, 4])
+            with b1:
+                st.button("Select all", on_click=_set_all, args=(True,),
+                          use_container_width=True)
+            with b2:
+                st.button("Clear all", on_click=_set_all, args=(False,),
+                          use_container_width=True)
+
+            left, right = st.columns(2)
+            for idx, p in enumerate(r["included"]):
+                label = f"[{idx + 1}] {p['title'][:70]}" + \
+                        ("…" if len(p["title"]) > 70 else "")
+                with (left if idx % 2 == 0 else right):
+                    if f"sel_{idx}" not in st.session_state:
+                        st.session_state[f"sel_{idx}"] = True
+                    st.checkbox(label, key=f"sel_{idx}", help=p["title"])
+
+            selected = [p for idx, p in enumerate(r["included"])
+                        if st.session_state.get(f"sel_{idx}", True)]
+            st.download_button(
+                f"Download {len(selected)} selected paper"
+                f"{'s' if len(selected) != 1 else ''} (.bib)",
+                make_bibtex(selected) if selected else "",
+                file_name="literature_review.bib", mime="text/plain",
+                disabled=not selected, type="primary")
+            if not selected:
+                st.caption("Select at least one paper to enable the download.")
+
+        # ---- Follow-up questions: extend the report, never replace it ----
+        st.divider()
+        st.markdown("#### Ask a follow-up")
+        st.caption("Follow-ups run a fresh search and append a new section to "
+                   "this report, continuing the same reference numbering.")
+
+        fu_clicked = None
+        suggestions = extract_open_questions(r["body"])
+        if suggestions:
+            scols = st.columns(len(suggestions))
+            for col, sq in zip(scols, suggestions):
+                with col:
+                    if st.button(sq[:64] + ("…" if len(sq) > 64 else ""),
+                                 key=f"fu_sugg_{abs(hash(sq)) % 10**8}",
+                                 help=sq, use_container_width=True):
+                        fu_clicked = sq
+
+        fc1, fc2 = st.columns([3, 1])
+        with fc1:
+            fu_text = st.text_input(
+                "Follow-up question", key="fu_input",
+                label_visibility="collapsed",
+                placeholder="e.g., Which interventions address these barriers?")
+        with fc2:
+            fu_run = st.button("Run follow-up", type="primary",
+                               use_container_width=True)
+
+        fu_q = fu_clicked or (fu_text.strip() if fu_run else "")
+        if fu_q:
+            if not api_key:
+                st.error("Add your API key in the sidebar to run follow-ups.")
+            else:
+                lim = PROVIDER_LIMITS[provider]
+                with st.status(f"Following up: {fu_q[:60]}…", expanded=True) as fst:
+                    st.write("Searching ERIC…")
+                    f_eric = fetch_eric(fu_q)
+                    st.write(f"ERIC returned {len(f_eric)}. Searching OpenAlex…")
+                    f_oa = fetch_openalex(fu_q)
+                    st.write(f"OpenAlex returned {len(f_oa)}. Searching Semantic Scholar…")
+                    f_s2 = fetch_semantic_scholar(fu_q, s2_key)
+                    st.write(f"Semantic Scholar returned {len(f_s2)}. Searching CrossRef…")
+                    f_cr = fetch_crossref(fu_q)
+                    st.write(f"CrossRef returned {len(f_cr)}. Screening…")
+
+                    prior_keys = set()
+                    for p in r["included"]:
+                        prior_keys.add(re.sub(r"\W+", "", p["title"].lower()))
+                        if p["doi"]:
+                            prior_keys.add(p["doi"].lower())
+                    f_all = f_eric + f_oa + f_s2 + f_cr
+                    f_screened, f_inc = dedupe_and_screen(
+                        f_all, max_included=min(12, lim["max_papers"]),
+                        prior_keys=prior_keys)
+
+                    if not f_inc:
+                        fst.update(label="No new papers found", state="error")
+                        st.warning("The follow-up search found no new papers "
+                                   "beyond those already in this report. Try "
+                                   "different wording — the report is unchanged.")
+                    else:
+                        start_n = len(r["included"]) + 1
+                        st.write(f"{len(f_inc)} new papers. Synthesizing addendum…")
+                        try:
+                            addendum = clean_llm_output(synthesize_followup(
+                                llm, fu_q, r["title"],
+                                build_context(f_inc, start=start_n,
+                                              abstract_chars=lim["abstract_chars"]),
+                                start_n))
+                        except Exception as e:
+                            fst.update(label="Follow-up failed", state="error")
+                            st.error(f"Follow-up synthesis failed: {e} — the "
+                                     "report is unchanged.")
+                            addendum = None
+                        if addendum:
+                            if not addendum.lstrip().startswith("## Follow-up"):
+                                addendum = f"## Follow-up: {fu_q}\n\n" + addendum
+                            r["body"] = r["body"].rstrip() + "\n\n" + addendum
+                            r["included"] = r["included"] + f_inc
+                            c = r["counts"]
+                            c["retrieved"] += len(f_all)
+                            c["eric"] += len(f_eric)
+                            c["openalex"] += len(f_oa)
+                            c["s2"] += len(f_s2)
+                            c["crossref"] = c.get("crossref", 0) + len(f_cr)
+                            c["screened"] += len(f_screened)
+                            c["included"] = len(r["included"])
+                            fst.update(label="Follow-up added to the report",
+                                       state="complete", expanded=False)
+                            st.session_state.pop("fu_input", None)
+                            st.rerun()
+
+# ==========================================================================
+# MODE 2 — Data explorer
+# ==========================================================================
+else:
+    dq = st.text_area(
+        "Data question", key="dq_input", height=90,
+        placeholder="e.g., How has US education spending changed versus peer "
+                    "countries?",
+        label_visibility="collapsed")
+
+    dc1, dc2 = st.columns([3, 1])
+    with dc1:
+        dcols = st.columns(len(DATA_EXAMPLES))
+        for col, ex in zip(dcols, DATA_EXAMPLES):
+            with col:
+                st.button(ex[:36] + "…", key=f"dex_{ex[:12]}",
+                          on_click=_set_data, args=(ex,),
+                          use_container_width=True, help=ex)
+    with dc2:
+        drun = st.button("Analyze data", type="primary",
+                         use_container_width=True)
+
+    with st.expander("Dataset and parameters", expanded=False):
+        o1, o2 = st.columns(2)
+        with o1:
+            auto = st.checkbox(
+                "Let the model choose the dataset from my question", value=True,
+                help="It must pick from the curated list below, so it can "
+                     "never invent an indicator code.")
+            labels = [f"{d['src']} — {d['label']}" for d in DATA_CATALOG]
+            manual_idx = st.selectbox(
+                "Dataset", range(len(DATA_CATALOG)),
+                format_func=lambda i: labels[i], disabled=auto)
+        with o2:
+            y0, y1 = st.slider("Years (World Bank & NCES)", 1995,
+                               date.today().year, (2010, 2022))
+            census_year = st.selectbox(
+                "Census ACS 5-year vintage",
+                list(range(date.today().year - 2, 2014, -1)), index=1)
+            country_set = st.selectbox("Countries (World Bank)",
+                                       list(COUNTRY_SETS))
+
+    if drun:
+        if not dq.strip():
+            st.error("Type a data question first — or tap one of the examples.")
             st.stop()
-        status.update(label="Report ready", state="complete", expanded=False)
+        if not api_key:
+            st.error("Add your API key in the sidebar to run the analysis step.")
+            st.stop()
 
-    meter, body = parse_meter(raw)
-    findings, body = parse_findings(body)
-    title, body = parse_title(body, q)
-    for k in [k for k in st.session_state if str(k).startswith("sel_")]:
-        del st.session_state[k]        # reset paper selections for the new result
-    st.session_state.result = {
-        "question": q, "title": title, "meter": meter, "findings": findings,
-        "mode": mode, "body": body, "counts": counts, "included": included,
-    }
+        q = dq.strip()
+        with st.status("Fetching data…", expanded=True) as status:
+            if auto:
+                st.write("Choosing the best dataset for your question…")
+                entry, fallback = pick_indicator(llm, q)
+                if fallback:
+                    st.write(f"Selected by {fallback}: {entry['label']}")
+            else:
+                entry, fallback = DATA_CATALOG[manual_idx], None
+            st.write(f"Querying {entry['src']}: {entry['label']}…")
+            ds = load_dataset(entry, {
+                "countries": COUNTRY_SETS[country_set], "y0": y0, "y1": y1,
+                "census_year": census_year, "census_key": census_key})
 
-if "result" not in st.session_state:
-    st.write("")
-    st.markdown(
-        '<div class="how-row">'
-        '<div class="how-card"><div class="how-step">Search</div>'
-        '<div class="how-title">Three free databases</div>'
-        '<div class="how-body">Your question runs against ERIC, OpenAlex, and '
-        'Semantic Scholar — up to 45 records per search.</div></div>'
-        '<div class="how-card"><div class="how-step">Screen</div>'
-        '<div class="how-title">PRISMA-style screening</div>'
-        '<div class="how-body">Duplicates are merged and papers without usable '
-        'abstracts are excluded, ranked by citation count.</div></div>'
-        '<div class="how-card"><div class="how-step">Synthesize</div>'
-        '<div class="how-title">Grounded report</div>'
-        '<div class="how-body">A five-section evidence report where every claim '
-        'cites a retrieved paper. Export to BibTeX or print-ready HTML.</div></div>'
-        "</div>",
-        unsafe_allow_html=True)
+            if not ds["rows"]:
+                status.update(label="No data returned", state="error")
+                st.error(f"{entry['src']} returned no observations for these "
+                         "parameters. Open **Dataset and parameters** and try "
+                         "a wider year range, an earlier Census vintage, or a "
+                         "different dataset.")
+                st.stop()
 
-if "result" in st.session_state:
-    r = st.session_state.result
-    meter, counts = r["meter"], r["counts"]
-    full_body = r["body"] + "\n\n" + make_references_md(r["included"])
-    report_html = decorate_report_html(
-        render_report_html(full_body), counts, r["included"])
+            st.write(f"{len(ds['rows'])} observations retrieved. Analyzing with "
+                     f"{'Gemini' if provider == 'gemini' else 'GPT-4.1'}…")
+            try:
+                raw = clean_llm_output(analyze_data(llm, q, ds))
+            except Exception as e:
+                status.update(label="Analysis failed", state="error")
+                st.error(f"Analysis failed: {e}")
+                st.stop()
+            status.update(label="Analysis ready", state="complete", expanded=False)
 
-    st.divider()
-    st.markdown(
-        '<div class="result-head">'
-        f'<div class="result-title">{html_lib.escape(r["title"])}</div>'
-        f'<div class="result-meta">{html_lib.escape(r["question"])} &middot; '
-        f'Generated {date.today().strftime("%B %d, %Y")} &middot; '
-        f'{counts["included"]} papers synthesized from '
-        f'{counts["retrieved"]} retrieved records</div></div>',
-        unsafe_allow_html=True)
+        title, body = parse_title(raw, entry["label"])
+        st.session_state.data_result = {"question": q, "title": title,
+                                        "body": body, "ds": ds}
 
-    if r.get("mode") == "landscape" and r.get("findings"):
-        st.markdown(findings_hero_html(r["findings"]), unsafe_allow_html=True)
-    elif meter:
-        st.markdown(verdict_html(meter), unsafe_allow_html=True)
+    if "data_result" not in st.session_state:
+        st.markdown(
+            '<div class="how-row">'
+            '<div class="how-card"><div class="how-step">Sources</div>'
+            '<div class="how-title">World Bank, Census, NCES</div>'
+            '<div class="how-body">Real statistics from official APIs — '
+            'education spending, enrollment, attainment, income, and school '
+            'finance.</div></div>'
+            '<div class="how-card"><div class="how-step">Curated</div>'
+            '<div class="how-title">No invented indicators</div>'
+            '<div class="how-body">The model picks from a fixed catalog of '
+            'verified indicator codes, so it can never fabricate a series.'
+            '</div></div>'
+            '<div class="how-card"><div class="how-step">Analyze</div>'
+            '<div class="how-title">Grounded in the numbers</div>'
+            '<div class="how-body">Charts are drawn from the data itself, and '
+            'every figure cited must appear in it. Export HTML or CSV.'
+            '</div></div></div>', unsafe_allow_html=True)
 
-    hero = (findings_hero_html(r["findings"])
-            if r.get("mode") == "landscape" and r.get("findings")
-            else verdict_html(meter))
-    html_out = build_html_export(r["title"], r["question"], hero,
-                                 report_html, counts)
-    dl1, dl2, _sp = st.columns([1, 1, 1])
-    with dl1:
-        st.download_button(
-            "Download report (HTML)", html_out,
-            file_name="deep_search_report.html", mime="text/html",
-            use_container_width=True, type="primary")
-    with dl2:
-        st.download_button(
-            "Download bibliography (.bib)", make_bibtex(r["included"]),
-            file_name="literature_review.bib", mime="text/plain",
-            use_container_width=True)
-    st.caption("Open the HTML report in a browser and press Ctrl+P / Cmd+P for "
-               "a clean PDF. To pick which papers go to Zotero, use the "
-               "Zotero export tab.")
+    if "data_result" in st.session_state:
+        dr = st.session_state.data_result
+        ds = dr["ds"]
+        chart = (series_chart_html(ds) if ds["shape"] == "series"
+                 else bar_chart_html(ds))
+        if not chart:
+            chart = bar_chart_html(ds)
+        visuals = (data_stats_html(ds) + chart
+                   + _figcap(1, html_lib.escape(ds["entry"]["label"])
+                             + " &middot; " + html_lib.escape(ds["note"])))
+        body_html = decorate_report_html(
+            render_report_html(dr["body"]), {}, [], fig_start=2)
 
-    if "## 5" not in r["body"]:
-        st.warning("This report looks shorter than expected — it may have been "
-                   "truncated. Running the search again usually fixes it.")
-
-    tab_report, tab_papers, tab_export = st.tabs(
-        ["Report", f"Included papers ({counts['included']})", "Zotero export"])
-
-    with tab_report:
-        st.markdown(f'<div class="report-doc">{report_html}</div>',
+        st.divider()
+        st.markdown(
+            '<div class="result-head">'
+            f'<div class="result-title">{html_lib.escape(dr["title"])}</div>'
+            f'<div class="result-meta">{html_lib.escape(dr["question"])} '
+            f'&middot; {ds["entry"]["src"]} &middot; {len(ds["rows"])} '
+            f'observations &middot; Generated '
+            f'{date.today().strftime("%B %d, %Y")}</div></div>',
+            unsafe_allow_html=True)
+        st.markdown(f'<div class="report-doc">{visuals}</div>',
                     unsafe_allow_html=True)
 
-    with tab_papers:
-        st.markdown(
-            "These are the only records the synthesis was allowed to cite. "
-            "Bracketed numbers in the report refer to this list.")
-        st.markdown(papers_html(r["included"]), unsafe_allow_html=True)
+        sub = (f'{html_lib.escape(dr["question"])} &middot; '
+               f'{html_lib.escape(ds["note"])} &middot; {len(ds["rows"])} '
+               f'observations &middot; Generated '
+               f'{date.today().strftime("%B %d, %Y")}')
+        html_out = build_html_export(
+            dr["title"], dr["question"], visuals, body_html, {},
+            brand=f'Data Analysis &middot; {html_lib.escape(ds["entry"]["src"])}',
+            subtitle=sub)
+        e1, e2, _e3 = st.columns([1, 1, 1])
+        with e1:
+            st.download_button("Download analysis (HTML)", html_out,
+                               file_name="data_analysis.html", mime="text/html",
+                               use_container_width=True, type="primary")
+        with e2:
+            st.download_button("Download data (.csv)", make_csv(ds),
+                               file_name="dataset.csv", mime="text/csv",
+                               use_container_width=True)
+        st.caption("Open the HTML analysis in a browser and press Ctrl+P / "
+                   "Cmd+P for a clean PDF. The CSV contains every observation "
+                   "retrieved.")
 
-    with tab_export:
-        st.markdown("Choose which papers to include, then download the .bib "
-                    "file and import it into Zotero via **File → Import**.")
-
-        def _set_all(value):
-            for k in range(len(r["included"])):
-                st.session_state[f"sel_{k}"] = value
-
-        b1, b2, _bsp = st.columns([1, 1, 4])
-        with b1:
-            st.button("Select all", on_click=_set_all, args=(True,),
-                      use_container_width=True)
-        with b2:
-            st.button("Clear all", on_click=_set_all, args=(False,),
-                      use_container_width=True)
-
-        left, right = st.columns(2)
-        for idx, p in enumerate(r["included"]):
-            label = f"[{idx + 1}] {p['title'][:70]}" + \
-                    ("…" if len(p["title"]) > 70 else "")
-            with (left if idx % 2 == 0 else right):
-                if f"sel_{idx}" not in st.session_state:
-                    st.session_state[f"sel_{idx}"] = True
-                st.checkbox(label, key=f"sel_{idx}", help=p["title"])
-
-        selected = [p for idx, p in enumerate(r["included"])
-                    if st.session_state.get(f"sel_{idx}", True)]
-        st.download_button(
-            f"Download {len(selected)} selected paper"
-            f"{'s' if len(selected) != 1 else ''} (.bib)",
-            make_bibtex(selected) if selected else "",
-            file_name="literature_review.bib", mime="text/plain",
-            disabled=not selected, type="primary")
-        if not selected:
-            st.caption("Select at least one paper to enable the download.")
-
-    # ---- Follow-up questions: extend the report, never replace it --------
-    st.divider()
-    st.markdown("#### Ask a follow-up")
-    st.caption("Follow-ups run a fresh search and append a new section to "
-               "this report, continuing the same reference numbering.")
-
-    fu_clicked = None
-    suggestions = extract_open_questions(r["body"])
-    if suggestions:
-        scols = st.columns(len(suggestions))
-        for col, sq in zip(scols, suggestions):
-            with col:
-                if st.button(sq[:64] + ("…" if len(sq) > 64 else ""),
-                             key=f"fu_sugg_{abs(hash(sq)) % 10**8}",
-                             help=sq, use_container_width=True):
-                    fu_clicked = sq
-
-    fc1, fc2 = st.columns([3, 1])
-    with fc1:
-        fu_text = st.text_input(
-            "Follow-up question", key="fu_input",
-            label_visibility="collapsed",
-            placeholder="e.g., Which interventions address these barriers?")
-    with fc2:
-        fu_run = st.button("Run follow-up", type="primary",
-                           use_container_width=True)
-
-    fu_q = fu_clicked or (fu_text.strip() if fu_run else "")
-    if fu_q:
-        if not api_key:
-            st.error("Add your Gemini API key in the sidebar to run follow-ups.")
-        else:
-            with st.status(f"Following up: {fu_q[:60]}…", expanded=True) as fst:
-                st.write("Searching ERIC…")
-                f_eric = fetch_eric(fu_q)
-                st.write(f"ERIC returned {len(f_eric)}. Searching OpenAlex…")
-                f_oa = fetch_openalex(fu_q)
-                st.write(f"OpenAlex returned {len(f_oa)}. Searching Semantic Scholar…")
-                f_s2 = fetch_semantic_scholar(fu_q, s2_key)
-                st.write(f"Semantic Scholar returned {len(f_s2)}. Screening…")
-
-                prior_keys = set()
-                for p in r["included"]:
-                    prior_keys.add(re.sub(r"\W+", "", p["title"].lower()))
-                    if p["doi"]:
-                        prior_keys.add(p["doi"].lower())
-                f_all = f_eric + f_oa + f_s2
-                f_screened, f_inc = dedupe_and_screen(
-                    f_all, max_included=12, prior_keys=prior_keys)
-
-                if not f_inc:
-                    fst.update(label="No new papers found", state="error")
-                    st.warning("The follow-up search found no new papers "
-                               "beyond those already in this report. Try "
-                               "different wording — the report is unchanged.")
-                else:
-                    start_n = len(r["included"]) + 1
-                    st.write(f"{len(f_inc)} new papers. Synthesizing addendum…")
-                    try:
-                        addendum = clean_llm_output(synthesize_followup(
-                            api_key, fu_q, r["title"],
-                            build_context(f_inc, start=start_n), start_n))
-                    except Exception as e:
-                        fst.update(label="Follow-up failed", state="error")
-                        st.error(f"Follow-up synthesis failed: {e} — the "
-                                 "report is unchanged.")
-                        addendum = None
-                    if addendum:
-                        if not addendum.lstrip().startswith("## Follow-up"):
-                            addendum = f"## Follow-up: {fu_q}\n\n" + addendum
-                        r["body"] = r["body"].rstrip() + "\n\n" + addendum
-                        r["included"] = r["included"] + f_inc
-                        c = r["counts"]
-                        c["retrieved"] += len(f_all)
-                        c["eric"] += len(f_eric)
-                        c["openalex"] += len(f_oa)
-                        c["s2"] += len(f_s2)
-                        c["screened"] += len(f_screened)
-                        c["included"] = len(r["included"])
-                        fst.update(label="Follow-up added to the report",
-                                   state="complete", expanded=False)
-                        st.session_state.pop("fu_input", None)
-                        st.rerun()
+        t_an, t_data = st.tabs(["Analysis", f"Data ({len(ds['rows'])} rows)"])
+        with t_an:
+            st.markdown(f'<div class="report-doc">{body_html}</div>',
+                        unsafe_allow_html=True)
+        with t_data:
+            st.markdown("Every figure in the analysis had to come from these "
+                        "observations.")
+            st.markdown(f'<div class="report-doc">{data_table_html(ds)}</div>',
+                        unsafe_allow_html=True)
