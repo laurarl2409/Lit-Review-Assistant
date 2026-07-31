@@ -1622,71 +1622,134 @@ COUNTRY_SETS = {
 # from this list — it never writes indicator codes, so it cannot invent one.
 DATA_CATALOG = [
     # --- World Bank (free, no key) ---------------------------------------
-    {"id": "wb_edu_gdp", "src": "World Bank", "kind": "wb",
+    {"id": "wb_edu_gdp", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SE.XPD.TOTL.GD.ZS", "unit": "% of GDP",
      "label": "Government expenditure on education (% of GDP)"},
-    {"id": "wb_edu_govt", "src": "World Bank", "kind": "wb",
+    {"id": "wb_edu_govt", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SE.XPD.TOTL.GB.ZS", "unit": "% of gov. spending",
      "label": "Education spending (% of government expenditure)"},
-    {"id": "wb_ter_enr", "src": "World Bank", "kind": "wb",
+    {"id": "wb_ter_enr", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SE.TER.ENRR", "unit": "% gross",
      "label": "Tertiary school enrollment (% gross)"},
-    {"id": "wb_sec_enr", "src": "World Bank", "kind": "wb",
+    {"id": "wb_sec_enr", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SE.SEC.ENRR", "unit": "% gross",
      "label": "Secondary school enrollment (% gross)"},
-    {"id": "wb_prm_enr", "src": "World Bank", "kind": "wb",
+    {"id": "wb_prm_enr", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SE.PRM.ENRR", "unit": "% gross",
      "label": "Primary school enrollment (% gross)"},
-    {"id": "wb_pupil_teacher", "src": "World Bank", "kind": "wb",
+    {"id": "wb_pupil_teacher", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SE.PRM.ENRL.TC.ZS", "unit": "pupils per teacher",
      "label": "Pupil-teacher ratio, primary"},
-    {"id": "wb_prm_compl", "src": "World Bank", "kind": "wb",
+    {"id": "wb_prm_compl", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SE.PRM.CMPT.ZS", "unit": "% of relevant age group",
      "label": "Primary completion rate"},
-    {"id": "wb_literacy", "src": "World Bank", "kind": "wb",
+    {"id": "wb_literacy", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SE.ADT.LITR.ZS", "unit": "% of people 15+",
      "label": "Adult literacy rate"},
-    {"id": "wb_youth_neet", "src": "World Bank", "kind": "wb",
+    {"id": "wb_youth_neet", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "SL.UEM.NEET.ZS", "unit": "% of youth",
      "label": "Youth not in education, employment or training (NEET)"},
-    {"id": "wb_gdp_pc", "src": "World Bank", "kind": "wb",
+    {"id": "wb_gdp_pc", "src": "World Bank", "kind": "wb", "level": "intl",
      "code": "NY.GDP.PCAP.CD", "unit": "current US$",
      "label": "GDP per capita (context indicator)"},
 
     # --- U.S. Census ACS 5-year (free, keyless for moderate use) ----------
-    {"id": "cs_ba", "src": "U.S. Census", "kind": "census_pct",
+    {"id": "cs_ba", "src": "U.S. Census", "kind": "census_pct", "level": "us",
      "num": "B15003_022E", "den": "B15003_001E", "unit": "% of adults 25+",
      "label": "Adults 25+ with a bachelor's degree"},
-    {"id": "cs_grad", "src": "U.S. Census", "kind": "census_pct",
+    {"id": "cs_grad", "src": "U.S. Census", "kind": "census_pct", "level": "us",
      "num": "B15003_023E", "den": "B15003_001E", "unit": "% of adults 25+",
      "label": "Adults 25+ with a master's degree"},
-    {"id": "cs_hs", "src": "U.S. Census", "kind": "census_pct",
+    {"id": "cs_hs", "src": "U.S. Census", "kind": "census_pct", "level": "us",
      "num": "B15003_017E", "den": "B15003_001E", "unit": "% of adults 25+",
      "label": "Adults 25+ with a high school diploma"},
-    {"id": "cs_income", "src": "U.S. Census", "kind": "census_val",
+    {"id": "cs_income", "src": "U.S. Census", "kind": "census_val", "level": "us",
      "num": "B19013_001E", "unit": "US$",
      "label": "Median household income"},
-    {"id": "cs_poverty", "src": "U.S. Census", "kind": "census_pct",
+    {"id": "cs_poverty", "src": "U.S. Census", "kind": "census_pct", "level": "us",
      "num": "B17001_002E", "den": "B17001_001E", "unit": "% of population",
      "label": "Population below the poverty line"},
-    {"id": "cs_enrolled", "src": "U.S. Census", "kind": "census_pct",
+    {"id": "cs_enrolled", "src": "U.S. Census", "kind": "census_pct", "level": "us",
      "num": "B14001_002E", "den": "B14001_001E", "unit": "% of population 3+",
      "label": "Population enrolled in school"},
 
-    # --- NCES via Urban Institute summary endpoints (free, no key) -------
-    {"id": "nces_enroll", "src": "NCES", "kind": "nces",
+    # --- IPEDS postsecondary, via the Urban Institute Education Data API --
+    # Variable names differ slightly across IPEDS vintages, so each entry
+    # carries aliases and the fetcher discovers the real one if needed.
+    {"id": "ipeds_admit", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "admissions-enrollment", "var": "number_admitted",
+     "aliases": ["number_admitted", "admissions_admitted", "admitted"],
+     "stat": "sum", "unit": "students",
+     "label": "Students admitted to 4-year institutions"},
+    {"id": "ipeds_applied", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "admissions-enrollment", "var": "number_applied",
+     "aliases": ["number_applied", "admissions_applied", "applied"],
+     "stat": "sum", "unit": "students",
+     "label": "Applications to 4-year institutions"},
+    {"id": "ipeds_enrolled", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "admissions-enrollment", "var": "number_enrolled_total",
+     "aliases": ["number_enrolled_total", "number_enrolled", "enrolled_total"],
+     "stat": "sum", "unit": "students",
+     "label": "First-time students enrolling at 4-year institutions"},
+    {"id": "ipeds_sfr", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "student-faculty-ratio", "var": "student_faculty_ratio",
+     "aliases": ["student_faculty_ratio", "stufacr"],
+     "stat": "avg", "unit": "students per faculty",
+     "label": "Student-to-faculty ratio"},
+    {"id": "ipeds_retention", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "fall-retention", "var": "ret_pct_ft",
+     "aliases": ["ret_pct_ft", "ret_pct_full_time", "retention_rate_ft"],
+     "stat": "avg", "unit": "%",
+     "label": "Full-time first-year retention rate"},
+    {"id": "ipeds_completers", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "completers", "var": "completers",
+     "aliases": ["completers", "number_completers"],
+     "stat": "sum", "unit": "graduates",
+     "label": "Degree and certificate completers"},
+    {"id": "ipeds_gradrate", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "grad-rates", "var": "grad_rate",
+     "aliases": ["grad_rate", "grad_rate_150", "graduation_rate"],
+     "stat": "avg", "unit": "%",
+     "label": "Graduation rate (150% of normal time)"},
+    {"id": "ipeds_pell", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "sfa-all-undergraduates", "var": "num_pell_grant",
+     "aliases": ["num_pell_grant", "pell_grant_num", "number_pell"],
+     "stat": "sum", "unit": "undergraduates",
+     "label": "Undergraduates receiving Pell grants"},
+    {"id": "ipeds_netprice", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "sfa-grants-and-net-price", "var": "avg_net_price",
+     "aliases": ["avg_net_price", "net_price", "average_net_price"],
+     "stat": "avg", "unit": "US$",
+     "label": "Average net price after grant aid"},
+    {"id": "ipeds_tuitionrev", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "finance", "var": "rev_tuition_fees_gross",
+     "aliases": ["rev_tuition_fees_gross", "rev_tuition_fees", "tuition_fees"],
+     "stat": "sum", "unit": "US$",
+     "label": "Gross tuition and fee revenue"},
+    {"id": "ipeds_instrexp", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "finance", "var": "exp_instruc_total",
+     "aliases": ["exp_instruc_total", "exp_instruction_total", "exp_instruc"],
+     "stat": "sum", "unit": "US$",
+     "label": "Total instructional expenditure"},
+    {"id": "ipeds_institutions", "src": "IPEDS", "kind": "ipeds", "level": "post",
+     "topic": "directory", "var": "unitid", "aliases": ["unitid"],
+     "stat": "count", "unit": "institutions",
+     "label": "Number of degree-granting institutions"},
+
+    # --- NCES K-12 via Urban Institute summary endpoints (free, no key) --
+    {"id": "nces_enroll", "src": "NCES K-12", "kind": "nces", "level": "k12",
      "section": "schools", "source": "ccd", "topic": "enrollment",
      "var": "enrollment", "stat": "sum", "unit": "students",
      "label": "Public school enrollment (CCD)"},
-    {"id": "nces_teachers", "src": "NCES", "kind": "nces",
+    {"id": "nces_teachers", "src": "NCES K-12", "kind": "nces", "level": "k12",
      "section": "schools", "source": "ccd", "topic": "directory",
      "var": "teachers_fte", "stat": "sum", "unit": "FTE teachers",
      "label": "Public school teachers, full-time equivalent (CCD)"},
-    {"id": "nces_frpl", "src": "NCES", "kind": "nces",
+    {"id": "nces_frpl", "src": "NCES K-12", "kind": "nces", "level": "k12",
      "section": "schools", "source": "ccd", "topic": "directory",
      "var": "free_or_reduced_price_lunch", "stat": "sum", "unit": "students",
      "label": "Students eligible for free/reduced-price lunch (CCD)"},
-    {"id": "nces_dist_rev", "src": "NCES", "kind": "nces",
+    {"id": "nces_dist_rev", "src": "NCES K-12", "kind": "nces", "level": "k12",
      "section": "school-districts", "source": "ccd", "topic": "finance",
      "var": "rev_total", "stat": "sum", "unit": "US$",
      "label": "School district total revenue (CCD finance)"},
@@ -1783,8 +1846,113 @@ def fetch_nces(entry, y0, y1):
     return rows
 
 
+IPEDS_BASE = "https://educationdata.urban.org/api/v1/college-university/ipeds"
+SKIP_VARS = {"unitid", "year", "fips", "campus_id", "inst_name", "opeid"}
+
+
+def fetch_ipeds(entry, y0, y1):
+    """IPEDS aggregates by state-year.
+
+    Tries the fast summary endpoint first. IPEDS variable names shift between
+    vintages, so on failure this falls back to reading raw records, discovers
+    the real column name from the response itself, and aggregates client-side.
+    """
+    rows, tried = [], []
+    years = [y for y in range(max(y0, 1990), y1 + 1)]
+    if not years:
+        return rows
+
+    # --- fast path: summary endpoint, trying each known alias -------------
+    for var in entry.get("aliases", [entry["var"]]):
+        tried.append(var)
+        try:
+            r = requests.get(
+                f"{IPEDS_BASE}/{entry['topic']}/summaries",
+                params={"var": var, "stat": entry["stat"], "by": "fips",
+                        "year": ",".join(str(y) for y in years)},
+                headers=HEADERS, timeout=60)
+            if r.status_code >= 400:
+                continue
+            payload = r.json()
+            recs = payload.get("results", payload) if isinstance(payload, dict) else payload
+            for o in recs or []:
+                v = _num(o.get(var, o.get(entry["stat"])))
+                fips = str(o.get("fips", "")).split(".")[0].zfill(2)
+                if v is None or fips not in FIPS:
+                    continue
+                rows.append({"entity": FIPS[fips],
+                             "year": int(o.get("year", years[-1])), "value": v})
+            if rows:
+                return rows
+        except Exception:
+            continue
+
+    # --- fallback: raw records, discover the column, aggregate locally ----
+    year = years[-1]
+    try:
+        r = requests.get(f"{IPEDS_BASE}/{entry['topic']}/{year}/",
+                         headers=HEADERS, timeout=90)
+        if r.status_code >= 400:
+            st.warning(f"IPEDS returned {r.status_code} for "
+                       f"{entry['topic']} {year}. Try a different year.")
+            return rows
+        payload = r.json()
+        recs = payload.get("results", []) if isinstance(payload, dict) else payload
+        if not recs:
+            st.warning(f"IPEDS has no {entry['topic']} records for {year}.")
+            return rows
+        cols = set(recs[0].keys())
+        col = next((c for c in entry.get("aliases", []) if c in cols), None)
+        if col is None:                      # last resort: fuzzy match
+            stem = entry["var"].split("_")[0]
+            col = next((c for c in cols
+                        if c not in SKIP_VARS and stem in c
+                        and isinstance(recs[0].get(c), (int, float))), None)
+        if col is None:
+            numeric = sorted(c for c in cols if c not in SKIP_VARS
+                             and isinstance(recs[0].get(c), (int, float)))
+            st.warning(
+                f"IPEDS no longer publishes '{entry['var']}' under "
+                f"{entry['topic']}. Available numeric variables include: "
+                f"{', '.join(numeric[:10])}.")
+            return rows
+        # paginate a little, then aggregate by state
+        agg, n = {}, 0
+        while recs and n < 6:
+            for o in recs:
+                v = _num(o.get(col))
+                fips = str(o.get("fips", "")).split(".")[0].zfill(2)
+                if v is None or fips not in FIPS:
+                    continue
+                k = (FIPS[fips], int(o.get("year", year)))
+                a = agg.setdefault(k, [0.0, 0])
+                a[0] += v
+                a[1] += 1
+            nxt = payload.get("next") if isinstance(payload, dict) else None
+            n += 1
+            if not nxt or n >= 6:
+                break
+            r = requests.get(nxt, headers=HEADERS, timeout=90)
+            if r.status_code >= 400:
+                break
+            payload = r.json()
+            recs = payload.get("results", [])
+        for (ent, yr), (total, cnt) in agg.items():
+            val = total / cnt if entry["stat"] == "avg" else (
+                cnt if entry["stat"] == "count" else total)
+            rows.append({"entity": ent, "year": yr, "value": val})
+    except Exception as e:
+        st.warning(f"IPEDS didn't respond ({e}).")
+    return rows
+
+
 def load_dataset(entry, opts):
-    if entry["kind"] == "wb":
+    if entry["kind"] == "ipeds":
+        rows = fetch_ipeds(entry, opts["y0"], opts["y1"])
+        note = (f"IPEDS {entry['topic']} ({entry['var']}, {entry['stat']}) "
+                f"by state, {opts['y0']}\u2013{opts['y1']}, via the Urban "
+                f"Institute Education Data Portal")
+    elif entry["kind"] == "wb":
         rows = fetch_worldbank(entry, opts["countries"], opts["y0"], opts["y1"])
         note = ("World Bank Open Data, indicator "
                 f"{entry['code']}, {opts['y0']}\u2013{opts['y1']}")
@@ -2010,31 +2178,78 @@ def analyze_data(llm, question, ds):
     return llm_complete(llm, DATA_SYSTEM_PROMPT, user_msg)
 
 
+# Words that appear in almost every education question and therefore carry no
+# signal about WHICH dataset is wanted. Matching on these is what caused
+# "parenting students" to be answered with general school enrollment.
+GENERIC = {"student", "students", "education", "educational", "school",
+           "schools", "college", "colleges", "university", "universities",
+           "american", "america", "national", "state", "states", "country",
+           "united", "many", "much", "number", "count", "total", "rate",
+           "percent", "percentage", "share", "average", "level", "levels",
+           "higher", "public", "private", "year", "years", "people"}
+# Fold in the search stopword list so common connectives ("the", "about",
+# "there") can't create a spurious one-word match.
+GENERIC |= STOPWORDS
+
+
 def pick_indicator(llm, question):
-    """Constrained selection: the model must return one catalog id, so it can
-    never invent an indicator code. Falls back to keyword matching."""
+    """Map a question to one catalog dataset, or admit there isn't one.
+
+    Returns (entry, note) on a match, or (None, reason) when nothing in the
+    catalog actually measures the concept. Answering a different question than
+    the one asked is worse than answering none, so the "no match" path is a
+    first-class outcome rather than a fallback.
+    """
     menu = "\n".join(f"{d['id']}: {d['label']} ({d['src']})"
                      for d in DATA_CATALOG)
     try:
         out = llm_complete(
             llm,
-            "You map a user's data question to exactly one dataset id from a "
-            "fixed list. Reply with the id only — no punctuation, no "
-            "explanation. If nothing fits well, reply with the closest id.",
+            "You map a data question to exactly one dataset id from a fixed "
+            "list, or reject it.\n"
+            "Reply with the id only, or the single word NONE.\n"
+            "Reply NONE if no dataset actually MEASURES the specific concept "
+            "asked about. A dataset about a broader population is NOT a "
+            "match: a question about parenting students, veterans, or "
+            "disabled students is NONE if the list only has total enrolment. "
+            "Only answer with an id when that dataset measures the thing "
+            "asked about, not merely a related population.",
             f"QUESTION: {question}\n\nAVAILABLE DATASET IDS:\n{menu}\n\n"
-            f"Reply with exactly one id from the list above.",
-            max_out=24).strip().split()[0].strip(".,:`'\"")
+            f"Reply with one id, or NONE.",
+            max_out=24).strip().split()[0].strip(".,:`'\"").lower()
         if out in CATALOG_BY_ID:
             return CATALOG_BY_ID[out], None
-    except Exception as e:
+        if out.startswith("none"):
+            return None, ("no dataset in the catalog measures this")
+    except Exception:
         pass
-    words = {w for w in re.findall(r"[a-z]{4,}", question.lower())}
+
+    # Keyword fallback — must match on a DISTINCTIVE word, not a generic one.
+    words = {w for w in re.findall(r"[a-z]{3,}", question.lower())} - GENERIC
     best, score = None, 0
     for d in DATA_CATALOG:
-        s = len(words & set(re.findall(r"[a-z]{4,}", d["label"].lower())))
+        label = set(re.findall(r"[a-z]{3,}", d["label"].lower())) - GENERIC
+        s = len(words & label)
         if s > score:
             best, score = d, s
-    return (best or DATA_CATALOG[0]), "keyword match"
+    # Require TWO distinctive words. One is too weak: "veteran students
+    # enrolled" overlaps "enrolled" with general enrolment while the word
+    # that matters — veteran — is measured by nothing here.
+    if best and score >= 2:
+        return best, "keyword match"
+    return None, "no dataset in the catalog measures this"
+
+
+def closest_datasets(question, n=4):
+    """Best-effort suggestions to show when nothing truly matches."""
+    words = {w for w in re.findall(r"[a-z]{3,}", question.lower())} - GENERIC
+    scored = []
+    for d in DATA_CATALOG:
+        label = set(re.findall(r"[a-z]{3,}", d["label"].lower())) - GENERIC
+        scored.append((len(words & label), d))
+    scored.sort(key=lambda x: -x[0])
+    return [d for _, d in scored[:n]]
+
 
 # ==========================================================================
 # Streamlit UI
@@ -2132,14 +2347,15 @@ with st.sidebar:
     st.markdown(
         "**Literature review** searches ERIC, OpenAlex, Semantic Scholar, and "
         "CrossRef, then synthesizes a grounded evidence report.\n\n"
-        "**Data explorer** pulls real statistics from the World Bank, U.S. "
-        "Census, and NCES, then analyzes them. In both modes the model may "
-        "only use what was retrieved.")
+        "**Data explorer** pulls real statistics from IPEDS, the World "
+        "Bank, U.S. Census, and NCES. If no dataset measures what you asked, "
+        "it says so instead of answering a different question.")
 
 # ---- Header + mode switch ------------------------------------------------
 st.markdown(
     '<div class="app-eyebrow">ERIC &middot; OpenAlex &middot; Semantic Scholar '
-    '&middot; CrossRef &middot; World Bank &middot; Census &middot; NCES</div>'
+    '&middot; CrossRef &middot; IPEDS &middot; World Bank &middot; Census '
+    '&middot; NCES</div>'
     '<p class="app-title">Education Research Assistant</p>'
     '<p class="app-sub">Synthesize the literature, or analyze real statistics '
     '\u2014 both grounded strictly in what the APIs return.</p>',
@@ -2467,7 +2683,10 @@ else:
                 "Let the model choose the dataset from my question", value=True,
                 help="It must pick from the curated list below, so it can "
                      "never invent an indicator code.")
-            labels = [f"{d['src']} — {d['label']}" for d in DATA_CATALOG]
+            _lvl = {"post": "Postsecondary", "k12": "K-12",
+                    "us": "U.S. population", "intl": "International"}
+            labels = [f"{_lvl.get(d.get('level'), '')} · {d['src']} — "
+                      f"{d['label']}" for d in DATA_CATALOG]
             manual_idx = st.selectbox(
                 "Dataset", range(len(DATA_CATALOG)),
                 format_func=lambda i: labels[i], disabled=auto)
@@ -2492,11 +2711,18 @@ else:
         with st.status("Fetching data…", expanded=True) as status:
             if auto:
                 st.write("Choosing the best dataset for your question…")
-                entry, fallback = pick_indicator(llm, q)
-                if fallback:
-                    st.write(f"Selected by {fallback}: {entry['label']}")
+                entry, note = pick_indicator(llm, q)
+                if entry is None:
+                    status.update(label="No dataset measures this",
+                                  state="error", expanded=False)
+                    st.session_state.data_nomatch = q
+                    st.session_state.pop("data_result", None)
+                    st.stop()
+                if note:
+                    st.write(f"Selected by {note}: {entry['label']}")
             else:
-                entry, fallback = DATA_CATALOG[manual_idx], None
+                entry, note = DATA_CATALOG[manual_idx], None
+            st.session_state.pop("data_nomatch", None)
             st.write(f"Querying {entry['src']}: {entry['label']}…")
             ds = load_dataset(entry, {
                 "countries": COUNTRY_SETS[country_set], "y0": y0, "y1": y1,
@@ -2524,14 +2750,34 @@ else:
         st.session_state.data_result = {"question": q, "title": title,
                                         "body": body, "ds": ds}
 
-    if "data_result" not in st.session_state:
+    if st.session_state.get("data_nomatch"):
+        nq = st.session_state["data_nomatch"]
+        st.warning(
+            f"**No dataset in this catalog measures that.** Rather than answer "
+            f"a different question, the search stopped.\n\n"
+            f"You asked about: *{nq}*")
+        st.markdown("These official APIs report totals and rates by "
+                    "institution or state, but none of them collects the "
+                    "student characteristic you asked about. Surveys like "
+                    "**NPSAS** (National Postsecondary Student Aid Study) do "
+                    "collect it, but NCES publishes NPSAS through DataLab / "
+                    "PowerStats rather than a public API, so it has to be "
+                    "queried by hand.")
+        st.markdown("**Closest datasets that _are_ available:**")
+        for d in closest_datasets(nq):
+            st.markdown(f"- {d['label']} — *{d['src']}*")
+        st.caption("Open **Dataset and parameters**, untick "
+                   "\u201cLet the model choose\u201d, and pick one directly "
+                   "to run it anyway.")
+
+    if "data_result" not in st.session_state and not st.session_state.get("data_nomatch"):
         st.markdown(
             '<div class="how-row">'
             '<div class="how-card"><div class="how-step">Sources</div>'
-            '<div class="how-title">World Bank, Census, NCES</div>'
+            '<div class="how-title">IPEDS, World Bank, Census, NCES</div>'
             '<div class="how-body">Real statistics from official APIs — '
-            'education spending, enrollment, attainment, income, and school '
-            'finance.</div></div>'
+            'postsecondary admissions, retention, completions, net price, '
+            'plus spending, attainment and income.</div></div>'
             '<div class="how-card"><div class="how-step">Curated</div>'
             '<div class="how-title">No invented indicators</div>'
             '<div class="how-body">The model picks from a fixed catalog of '
