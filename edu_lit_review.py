@@ -1673,6 +1673,82 @@ DATA_CATALOG = [
      "num": "B14001_002E", "den": "B14001_001E", "unit": "% of population 3+",
      "label": "Population enrolled in school"},
 
+    # --- Census PSEO: graduate earnings linked to LEHD wage records -------
+    # Earnings geography must be national; INST_LEVEL=S yields state
+    # aggregates and GRAD_COHORT supplies the time axis.
+    {"id": "pseo_y1", "src": "Census PSEO", "kind": "pseo", "level": "post",
+     "ind": "Y1_P50_EARNINGS", "by": "state", "unit": "US$",
+     "label": "Median earnings 1 year after graduation (by state)"},
+    {"id": "pseo_y5", "src": "Census PSEO", "kind": "pseo", "level": "post",
+     "ind": "Y5_P50_EARNINGS", "by": "state", "unit": "US$",
+     "label": "Median earnings 5 years after graduation (by state)"},
+    {"id": "pseo_y10", "src": "Census PSEO", "kind": "pseo", "level": "post",
+     "ind": "Y10_P50_EARNINGS", "by": "state", "unit": "US$",
+     "label": "Median earnings 10 years after graduation (by state)"},
+    {"id": "pseo_field5", "src": "Census PSEO", "kind": "pseo", "level": "post",
+     "ind": "Y5_P50_EARNINGS", "by": "field", "unit": "US$",
+     "label": "Median earnings 5 years after graduation, by degree field"},
+    {"id": "pseo_field10", "src": "Census PSEO", "kind": "pseo", "level": "post",
+     "ind": "Y10_P50_EARNINGS", "by": "field", "unit": "US$",
+     "label": "Median earnings 10 years after graduation, by degree field"},
+    {"id": "pseo_p25", "src": "Census PSEO", "kind": "pseo", "level": "post",
+     "ind": "Y5_P25_EARNINGS", "by": "state", "unit": "US$",
+     "label": "25th-percentile earnings 5 years after graduation (by state)"},
+
+    # --- College Scorecard (institution level, aggregated to states) ------
+    {"id": "sc_earn10", "src": "College Scorecard", "kind": "scorecard",
+     "level": "post", "field": "latest.earnings.10_yrs_after_entry.median",
+     "agg": "median", "unit": "US$",
+     "label": "Median earnings 10 years after entry"},
+    {"id": "sc_cost", "src": "College Scorecard", "kind": "scorecard",
+     "level": "post", "field": "latest.cost.attendance.academic_year",
+     "agg": "median", "unit": "US$",
+     "label": "Average annual cost of attendance"},
+    {"id": "sc_debt", "src": "College Scorecard", "kind": "scorecard",
+     "level": "post", "field": "latest.aid.median_debt.completers.overall",
+     "agg": "median", "unit": "US$",
+     "label": "Median debt at graduation"},
+    {"id": "sc_completion", "src": "College Scorecard", "kind": "scorecard",
+     "level": "post", "field": "latest.completion.rate_suppressed.overall",
+     "agg": "median", "unit": "%", "scale": 100,
+     "label": "Completion rate (150% of normal time)"},
+    {"id": "sc_admit", "src": "College Scorecard", "kind": "scorecard",
+     "level": "post", "field": "latest.admissions.admission_rate.overall",
+     "agg": "median", "unit": "%", "scale": 100,
+     "label": "Admission rate"},
+    {"id": "sc_pellshare", "src": "College Scorecard", "kind": "scorecard",
+     "level": "post", "field": "latest.aid.pell_grant_rate",
+     "agg": "median", "unit": "%", "scale": 100,
+     "label": "Share of undergraduates receiving Pell grants"},
+    {"id": "sc_firstgen", "src": "College Scorecard", "kind": "scorecard",
+     "level": "post", "field": "latest.student.share_firstgeneration",
+     "agg": "median", "unit": "%", "scale": 100,
+     "label": "Share of first-generation students"},
+    {"id": "sc_size", "src": "College Scorecard", "kind": "scorecard",
+     "level": "post", "field": "latest.student.size",
+     "agg": "sum", "unit": "students",
+     "label": "Undergraduate enrollment"},
+
+    # --- BLS labor market -------------------------------------------------
+    {"id": "bls_unemp_edu", "src": "BLS", "kind": "bls", "level": "labor",
+     "series": {"LNS14027659": "Less than a high school diploma",
+                "LNS14027660": "High school graduates, no college",
+                "LNS14027689": "Some college or associate degree",
+                "LNS14027662": "Bachelor's degree and higher"},
+     "unit": "%", "label": "Unemployment rate by education level"},
+    {"id": "bls_lfpr_edu", "src": "BLS", "kind": "bls", "level": "labor",
+     "series": {"LNS11327659": "Less than a high school diploma",
+                "LNS11327660": "High school graduates, no college",
+                "LNS11327689": "Some college or associate degree",
+                "LNS11327662": "Bachelor's degree and higher"},
+     "unit": "%", "label": "Labor force participation rate by education level"},
+    {"id": "bls_unemp", "src": "BLS", "kind": "bls", "level": "labor",
+     "series": {"LNS14000000": "Unemployment rate, all workers"},
+     "unit": "%", "label": "Overall unemployment rate"},
+    {"id": "bls_employment", "src": "BLS", "kind": "bls", "level": "labor",
+     "series": {"CES0000000001": "Total nonfarm employment"},
+     "unit": "thousands of jobs", "label": "Total nonfarm employment"},
+
     # --- IPEDS postsecondary, via the Urban Institute Education Data API --
     # Variable names differ slightly across IPEDS vintages, so each entry
     # carries aliases and the fetcher discovers the real one if needed.
@@ -1946,8 +2022,170 @@ def fetch_ipeds(entry, y0, y1):
     return rows
 
 
+def fetch_pseo(entry, census_key):
+    """Census PSEO — graduate earnings matched to LEHD wage records.
+
+    Earnings geography must be national (`for=us:1`); INST_LEVEL=S returns
+    state aggregates, and asking for a categorical variable in `get` returns
+    every one of its values, which supplies the entity and year axes.
+    """
+    rows = []
+    if not census_key:
+        st.warning("PSEO needs a Census API key (free, in the sidebar). "
+                   "The Census API now requires a key for every query.")
+        return rows
+    by_state = entry["by"] == "state"
+    get = [entry["ind"], "GRAD_COHORT",
+           "LABEL_INST_STATE" if by_state else "LABEL_CIPCODE"]
+    params = {"get": ",".join(get), "for": "us:1", "INST_LEVEL": "S",
+              "DEGREE_LEVEL": "05", "key": census_key}
+    if not by_state:
+        params["CIP_LEVEL"] = "2"
+    try:
+        r = requests.get("https://api.census.gov/data/timeseries/pseo/earnings",
+                         params=params, headers=HEADERS, timeout=60)
+        if r.status_code >= 400:
+            st.warning(f"PSEO query rejected — {_api_error(r)}")
+            return rows
+        table = r.json()
+        cols = table[0]
+        ind_i = cols.index(entry["ind"])
+        lab_i = cols.index("LABEL_INST_STATE" if by_state else "LABEL_CIPCODE")
+        yr_i = cols.index("GRAD_COHORT")
+        for rec in table[1:]:
+            v = _num(rec[ind_i])
+            label = (rec[lab_i] or "").strip()
+            if v is None or not label or label.lower().startswith("all "):
+                continue
+            try:
+                yr = int(rec[yr_i])
+            except (TypeError, ValueError):
+                continue
+            if yr == 0:                       # 0000 = pooled across cohorts
+                continue
+            rows.append({"entity": label[:40], "year": yr, "value": v})
+    except Exception as e:
+        st.warning(f"PSEO didn't respond ({e}).")
+    return rows
+
+
+SCORECARD_URL = "https://api.data.gov/ed/collegescorecard/v1/schools"
+
+
+def fetch_scorecard(entry, key):
+    """College Scorecard is institution-level; aggregate to states so it fits
+    the same entity/value shape as the other sources."""
+    rows = []
+    if not key:
+        st.warning("College Scorecard needs a free api.data.gov key "
+                   "(sidebar). Get one at api.data.gov/signup.")
+        return rows
+    field, buckets = entry["field"], {}
+    try:
+        for page in range(6):                 # ~600 institutions is plenty
+            r = requests.get(SCORECARD_URL, params={
+                "api_key": key, "fields": f"school.state,{field}",
+                "school.degrees_awarded.predominant": "3",
+                "school.operating": "1",
+                "per_page": 100, "page": page}, headers=HEADERS, timeout=60)
+            if r.status_code >= 400:
+                st.warning(f"College Scorecard rejected the request — "
+                           f"{_api_error(r)}")
+                return rows
+            payload = r.json()
+            results = payload.get("results") or []
+            for o in results:
+                stt = o.get("school.state") or o.get("school", {}).get("state")
+                v = _num(o.get(field))
+                if v is None or not stt:
+                    continue
+                buckets.setdefault(stt, []).append(v)
+            meta = payload.get("metadata") or {}
+            if not results or (page + 1) * 100 >= (meta.get("total") or 0):
+                break
+    except Exception as e:
+        st.warning(f"College Scorecard didn't respond ({e}).")
+        return rows
+    scale = entry.get("scale", 1)
+    year = date.today().year
+    for stt, vals in buckets.items():
+        vals.sort()
+        if entry["agg"] == "sum":
+            v = sum(vals)
+        else:
+            n = len(vals)
+            v = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+        rows.append({"entity": stt, "year": year, "value": v * scale})
+    return rows
+
+
+def fetch_bls(entry, y0, y1, key):
+    """BLS v2 timeseries. Monthly observations are averaged to annual."""
+    rows = []
+    body = {"seriesid": list(entry["series"]),
+            "startyear": str(max(y0, 1976)), "endyear": str(y1)}
+    if key:
+        body["registrationkey"] = key
+    try:
+        r = requests.post("https://api.bls.gov/publicAPI/v2/timeseries/data/",
+                          json=body, headers={"Content-Type": "application/json"},
+                          timeout=60)
+        if r.status_code >= 400:
+            st.warning(f"BLS rejected the request — {_api_error(r)}")
+            return rows
+        payload = r.json()
+        if payload.get("status") != "REQUEST_SUCCEEDED":
+            msgs = "; ".join(payload.get("message") or []) or payload.get("status")
+            st.warning(f"BLS: {msgs}. A free key from "
+                       "data.bls.gov/registrationEngine raises the limits.")
+            return rows
+        for s in payload.get("Results", {}).get("series", []):
+            name = entry["series"].get(s.get("seriesID"), s.get("seriesID"))
+            annual, monthly = {}, {}
+            for d in s.get("data", []):
+                v = _num(d.get("value"))
+                period = str(d.get("period", ""))
+                if v is None or not period.startswith("M"):
+                    continue
+                try:
+                    yr = int(d["year"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if period == "M13":            # BLS's own annual average
+                    annual[yr] = v
+                else:
+                    a = monthly.setdefault(yr, [0.0, 0])
+                    a[0] += v
+                    a[1] += 1
+            for yr in set(annual) | set(monthly):
+                if yr in annual:               # authoritative — never blended
+                    val = annual[yr]
+                else:
+                    total, n = monthly[yr]
+                    val = total / n
+                rows.append({"entity": name, "year": yr, "value": val})
+    except Exception as e:
+        st.warning(f"BLS didn't respond ({e}).")
+    return rows
+
+
 def load_dataset(entry, opts):
-    if entry["kind"] == "ipeds":
+    if entry["kind"] == "pseo":
+        rows = fetch_pseo(entry, opts.get("census_key", ""))
+        note = (f"U.S. Census PSEO ({entry['ind']}), baccalaureate graduates, "
+                f"state aggregates by graduation cohort; earnings matched to "
+                f"LEHD wage records")
+    elif entry["kind"] == "scorecard":
+        rows = fetch_scorecard(entry, opts.get("scorecard_key", ""))
+        note = (f"College Scorecard, {entry['field']}, "
+                f"{entry['agg']} across predominantly bachelor's-degree "
+                f"institutions, by state")
+    elif entry["kind"] == "bls":
+        rows = fetch_bls(entry, opts["y0"], opts["y1"], opts.get("bls_key", ""))
+        note = (f"U.S. Bureau of Labor Statistics, series "
+                f"{', '.join(entry['series'])}, annual averages of monthly "
+                f"observations, {opts['y0']}\u2013{opts['y1']}")
+    elif entry["kind"] == "ipeds":
         rows = fetch_ipeds(entry, opts["y0"], opts["y1"])
         note = (f"IPEDS {entry['topic']} ({entry['var']}, {entry['stat']}) "
                 f"by state, {opts['y0']}\u2013{opts['y1']}, via the Urban "
@@ -2226,16 +2464,21 @@ def pick_indicator(llm, question):
 
     # Keyword fallback — must match on a DISTINCTIVE word, not a generic one.
     words = {w for w in re.findall(r"[a-z]{3,}", question.lower())} - GENERIC
-    best, score = None, 0
+    best, score, covered = None, 0, False
     for d in DATA_CATALOG:
         label = set(re.findall(r"[a-z]{3,}", d["label"].lower())) - GENERIC
+        if not label:
+            continue
         s = len(words & label)
-        if s > score:
-            best, score = d, s
-    # Require TWO distinctive words. One is too weak: "veteran students
-    # enrolled" overlaps "enrolled" with general enrolment while the word
-    # that matters — veteran — is measured by nothing here.
-    if best and score >= 2:
+        # Accept on either two distinctive words, or full coverage of a short
+        # label ("Admission rate" has just one distinctive word). A single
+        # partial hit is rejected: "veteran students enrolled" overlaps only
+        # "enrolled" with general enrolment, while the word that decides the
+        # question — veteran — is measured by nothing in the catalog.
+        full = s == len(label)
+        if s > score or (s == score and full and not covered):
+            best, score, covered = d, s, full
+    if best and score and (score >= 2 or covered):
         return best, "keyword match"
     return None, "no dataset in the catalog measures this"
 
@@ -2267,9 +2510,9 @@ LIT_EXAMPLES = [
     "Does one-to-one device access improve literacy outcomes?",
 ]
 DATA_EXAMPLES = [
-    "How has US education spending changed versus peer countries?",
-    "Which states have the highest share of adults with a bachelor's degree?",
-    "How has public school enrollment shifted across states?",
+    "Median earnings 10 years after graduation by state",
+    "Unemployment rate by education level over time",
+    "Median student debt at graduation across states",
 ]
 
 
@@ -2340,22 +2583,41 @@ with st.sidebar:
     census_key = st.text_input(
         "U.S. Census key", type="password",
         value=os.environ.get("CENSUS_API_KEY", ""),
-        help="Optional. Census works without a key for moderate use.")
+        help="Required by the Census API for ACS and PSEO queries. Free.")
+    if not census_key:
+        st.caption("[Census key required for ACS + PSEO]"
+                   "(https://api.census.gov/data/key_signup.html)")
+    scorecard_key = st.text_input(
+        "College Scorecard key", type="password",
+        value=os.environ.get("SCORECARD_API_KEY", ""),
+        help="Free api.data.gov key, used for College Scorecard datasets.")
+    if not scorecard_key:
+        st.caption("[Free key at api.data.gov/signup]"
+                   "(https://api.data.gov/signup/)")
+    bls_key = st.text_input(
+        "BLS key", type="password",
+        value=os.environ.get("BLS_API_KEY", ""),
+        help="Optional. BLS allows limited anonymous queries; a free key "
+             "raises the daily limit.")
+    if not bls_key:
+        st.caption("[Free key at data.bls.gov/registrationEngine]"
+                   "(https://data.bls.gov/registrationEngine/)")
 
     st.divider()
     st.markdown("#### About")
     st.markdown(
         "**Literature review** searches ERIC, OpenAlex, Semantic Scholar, and "
         "CrossRef, then synthesizes a grounded evidence report.\n\n"
-        "**Data explorer** pulls real statistics from IPEDS, the World "
-        "Bank, U.S. Census, and NCES. If no dataset measures what you asked, "
-        "it says so instead of answering a different question.")
+        "**Data explorer** pulls real statistics from IPEDS, Census PSEO, "
+        "College Scorecard, BLS, the World Bank, Census and NCES. If no "
+        "dataset measures what you asked, it says so instead of answering a "
+        "different question.")
 
 # ---- Header + mode switch ------------------------------------------------
 st.markdown(
     '<div class="app-eyebrow">ERIC &middot; OpenAlex &middot; Semantic Scholar '
-    '&middot; CrossRef &middot; IPEDS &middot; World Bank &middot; Census '
-    '&middot; NCES</div>'
+    '&middot; CrossRef &middot; IPEDS &middot; PSEO &middot; SCORECARD '
+    '&middot; BLS &middot; WORLD BANK &middot; CENSUS</div>'
     '<p class="app-title">Education Research Assistant</p>'
     '<p class="app-sub">Synthesize the literature, or analyze real statistics '
     '\u2014 both grounded strictly in what the APIs return.</p>',
@@ -2684,7 +2946,8 @@ else:
                 help="It must pick from the curated list below, so it can "
                      "never invent an indicator code.")
             _lvl = {"post": "Postsecondary", "k12": "K-12",
-                    "us": "U.S. population", "intl": "International"}
+                    "us": "U.S. population", "intl": "International",
+                    "labor": "Labor market"}
             labels = [f"{_lvl.get(d.get('level'), '')} · {d['src']} — "
                       f"{d['label']}" for d in DATA_CATALOG]
             manual_idx = st.selectbox(
@@ -2726,7 +2989,8 @@ else:
             st.write(f"Querying {entry['src']}: {entry['label']}…")
             ds = load_dataset(entry, {
                 "countries": COUNTRY_SETS[country_set], "y0": y0, "y1": y1,
-                "census_year": census_year, "census_key": census_key})
+                "census_year": census_year, "census_key": census_key,
+                "scorecard_key": scorecard_key, "bls_key": bls_key})
 
             if not ds["rows"]:
                 status.update(label="No data returned", state="error")
@@ -2774,10 +3038,10 @@ else:
         st.markdown(
             '<div class="how-row">'
             '<div class="how-card"><div class="how-step">Sources</div>'
-            '<div class="how-title">IPEDS, World Bank, Census, NCES</div>'
+            '<div class="how-title">IPEDS, PSEO, Scorecard, BLS</div>'
             '<div class="how-body">Real statistics from official APIs — '
-            'postsecondary admissions, retention, completions, net price, '
-            'plus spending, attainment and income.</div></div>'
+            'graduate earnings, admissions, completions, debt, plus '
+            'labor-market and international indicators.</div></div>'
             '<div class="how-card"><div class="how-step">Curated</div>'
             '<div class="how-title">No invented indicators</div>'
             '<div class="how-body">The model picks from a fixed catalog of '
